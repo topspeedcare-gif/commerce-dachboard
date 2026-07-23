@@ -4,11 +4,6 @@ shared/db.py — 공유 데이터 레이어
 역할: 웹 대시보드(정산·재고·광고분석)와 AI 비서봇(Slack)이 함께 읽고 쓰는
 단 하나의 SQLite DB. 이 파일 하나만 두 시스템이 공유하고,
 나머지 로직은 절대 서로의 코드를 import 하지 않는다.
-
-테이블 3개:
-  daily_metrics : 상품별 일일 매출/광고/재고/실손익 (대시보드가 씀)
-  inventory     : 실시간 재고 수량 (대시보드가 씀, 비서봇은 읽기만)
-  alerts        : 이상 징후 이벤트 (대시보드가 감지해서 씀, 비서봇은 읽어서 슬랙 알림)
 """
 from __future__ import annotations
 
@@ -47,10 +42,15 @@ CREATE TABLE IF NOT EXISTS inventory (
 CREATE TABLE IF NOT EXISTS alerts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      TEXT NOT NULL,
-    kind            TEXT NOT NULL,   -- 'ad_issue' | 'low_stock' | 'settlement'
+    kind            TEXT NOT NULL,
     sku             TEXT,
     message         TEXT NOT NULL,
     sent_to_slack   INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key             TEXT PRIMARY KEY,
+    value           TEXT NOT NULL
 );
 """
 
@@ -72,7 +72,6 @@ def init_db() -> None:
 
 
 def upsert_daily_metric(row: dict) -> None:
-    """대시보드 sync_job이 하루 집계 결과를 저장할 때 호출."""
     cols = list(row.keys())
     placeholders = ", ".join(f":{c}" for c in cols)
     updates = ", ".join(f"{c}=excluded.{c}" for c in cols if c not in ("date", "sku"))
@@ -115,7 +114,6 @@ def add_alert(kind: str, message: str, created_at: str, sku: str | None = None) 
 
 
 def get_unsent_alerts() -> list[sqlite3.Row]:
-    """비서봇이 폴링해서 슬랙으로 쏘고 나면 mark_alert_sent 호출."""
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM alerts WHERE sent_to_slack = 0 ORDER BY id"
@@ -125,6 +123,21 @@ def get_unsent_alerts() -> list[sqlite3.Row]:
 def mark_alert_sent(alert_id: int) -> None:
     with get_conn() as conn:
         conn.execute("UPDATE alerts SET sent_to_slack = 1 WHERE id = ?", (alert_id,))
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
 
 if __name__ == "__main__":
