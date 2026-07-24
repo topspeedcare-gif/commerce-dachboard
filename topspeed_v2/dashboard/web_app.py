@@ -27,6 +27,9 @@ from shared.db import (
     set_setting,
     add_experiment,
     update_experiment_status,
+    add_inventory_move,
+    get_inventory_moves,
+    InsufficientStockError,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
@@ -202,6 +205,65 @@ with tab_inv:
         upsert_inventory(sku, product_name, int(coupang_qty), int(office_qty), datetime.now().isoformat())
         st.success(f"{sku} 재고 업데이트 완료")
         st.rerun()
+
+    st.divider()
+    st.subheader("📥 입고 등록")
+    st.caption("1차 물류가 사무실 창고로 들어올 때 등록합니다.")
+    with st.form("inbound_form"):
+        in_sku = st.text_input("SKU", key="in_sku")
+        in_qty = st.number_input("수량", min_value=1, step=1, key="in_qty")
+        in_note = st.text_input("메모 (선택)", key="in_note")
+        in_submitted = st.form_submit_button("입고 등록")
+    if in_submitted:
+        if not in_sku:
+            st.error("SKU를 입력하세요.")
+        else:
+            add_inventory_move(in_sku, "inbound", int(in_qty), datetime.now().isoformat(), note=in_note or None)
+            st.success(f"{in_sku} {int(in_qty)}개 입고 등록 완료")
+            st.rerun()
+
+    st.subheader("🚚 쿠팡 이관")
+    st.caption("사무실 창고 재고를 쿠팡(로켓그로스) 창고로 이관합니다.")
+    with st.form("transfer_form"):
+        tr_sku = st.text_input("SKU", key="tr_sku")
+        tr_qty = st.number_input("수량", min_value=1, step=1, key="tr_qty")
+        tr_submitted = st.form_submit_button("쿠팡 이관 등록")
+    if tr_submitted:
+        if not tr_sku:
+            st.error("SKU를 입력하세요.")
+        else:
+            try:
+                add_inventory_move(tr_sku, "transfer_to_coupang", int(tr_qty), datetime.now().isoformat())
+                st.success(f"{tr_sku} {int(tr_qty)}개 쿠팡 이관 완료")
+                st.rerun()
+            except InsufficientStockError as exc:
+                st.error(f"❌ {exc}")
+
+    st.subheader("📦 기타채널 출고")
+    st.caption("네이버·토스 등 다른 채널 주문을 사무실 창고에서 일반택배로 출고할 때 등록합니다.")
+    with st.form("outbound_form"):
+        ob_sku = st.text_input("SKU", key="ob_sku")
+        ob_qty = st.number_input("수량", min_value=1, step=1, key="ob_qty")
+        ob_channel = st.selectbox("채널", ["네이버", "토스", "기타"], key="ob_channel")
+        ob_submitted = st.form_submit_button("출고 등록")
+    if ob_submitted:
+        if not ob_sku:
+            st.error("SKU를 입력하세요.")
+        else:
+            try:
+                add_inventory_move(ob_sku, "outbound_other", int(ob_qty), datetime.now().isoformat(), channel=ob_channel)
+                st.success(f"{ob_sku} {int(ob_qty)}개 {ob_channel} 출고 완료")
+                st.rerun()
+            except InsufficientStockError as exc:
+                st.error(f"❌ {exc}")
+
+    st.divider()
+    st.subheader("최근 재고 이동 이력 (최근 20건)")
+    moves = get_inventory_moves(limit=20)
+    if not moves:
+        st.write("이동 이력이 없습니다.")
+    else:
+        st.dataframe([dict(m) for m in moves], use_container_width=True)
 
 
 # 4) 실험 관리 — 신상품/광고 테스트 가설 등록·판정
