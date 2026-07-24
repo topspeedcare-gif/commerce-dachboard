@@ -124,6 +124,13 @@ def main() -> None:
     log(f"git push: {out}")
     if code == 0:
         log("✅ GitHub 반영 완료 — Streamlit Cloud가 곧 자동 재배포됩니다")
+
+        try:
+            from automation.kakao_notify import send_daily_summary
+            kakao_result = send_daily_summary(target_date)
+            log(f"카카오톡 알림 발송: {kakao_result}")
+        except Exception as exc:
+            log(f"⚠️ 카카오톡 알림 발송 실패 (동기화 자체는 정상 완료됨): {exc}")
     else:
         log("❌ push 실패 — 수동으로 'git push' 한번 실행해서 인증을 확인해보세요")
 
