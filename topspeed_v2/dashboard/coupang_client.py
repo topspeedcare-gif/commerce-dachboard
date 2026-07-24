@@ -120,18 +120,25 @@ class CoupangClient:
         }
         return self._get(path, params)
 
-    def list_orders_range(self, days_back: int = 7) -> list[dict]:
-        """최근 N일 전체 주문 수집 (완료 포함)"""
+    def list_orders_range(self, days_back: int = 7) -> tuple[list[dict], list[str]]:
+        """
+        최근 N일 전체 주문 수집 (완료 포함)
+
+        반환: (주문 리스트, 에러 메시지 리스트)
+        이전엔 실패를 조용히 넘어가서 "주문 0건"이 진짜 0건인지
+        인증 실패인지 구분이 안 됐음 — 이제 에러를 같이 반환한다.
+        """
         start, end = self._date_range(days_back)
         all_orders: list[dict] = []
+        errors: list[str] = []
         for status in ["ACCEPT", "INSTRUCT", "DEPARTURE", "DELIVERING", "FINAL_DELIVERY"]:
             try:
                 data = self.list_orders(start, end, status=status, max_per_page=100)
                 orders = data.get("data") or []
                 all_orders.extend(orders)
-            except CoupangClientUnavailable:
-                continue
-        return all_orders
+            except CoupangClientUnavailable as exc:
+                errors.append(f"{status} 상태 조회 실패: {exc}")
+        return all_orders, errors
 
     # ── 취소·반품 ─────────────────────────────────────────────
     def list_cancels(self, created_at_from: str, created_at_to: str) -> dict:
