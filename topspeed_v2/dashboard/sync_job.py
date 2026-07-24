@@ -69,7 +69,10 @@ def run_sync(
         return f"❌ 쿠팡 오픈API 미연결: {exc}"
 
     # 1. 주문 데이터 수집 → SKU별 집계
-    orders = client.list_orders_range(days_back=1)
+    orders, order_errors = client.list_orders_range(days_back=1)
+    for err in order_errors:
+        log.append(f"⚠️ 주문 {err}")
+
     per_sku_sales: dict[str, dict] = defaultdict(lambda: {"qty": 0, "revenue": 0})
     for order in orders:
         for item in order.get("items", []):
@@ -125,27 +128,48 @@ def run_sync(
         if issue:
             add_alert(kind="ad_issue", message=issue, created_at=datetime.now(KST).isoformat(), sku=sku)
 
-    # 4. 재고 수집·저장
+    # 4. 재고 수집·저장 — 로켓그로스 먼저 시도, 권한 없으면(403 등) 판매자배송으로 폴백
+    inventory_items: list[dict] = []
     try:
-        rocket_inv = client.list_rocket_growth_inventory()
-        for item in rocket_inv:
-            upsert_inventory(
-                sku=item["vendorItemId"],
-                product_name=item.get("sellerProductName", ""),
-                coupang_qty=item.get("quantity", 0),
-                office_qty=0,
-                updated_at=datetime.now(KST).isoformat(),
-            )
-            low_stock_floor = int(get_setting("low_stock_floor", "5"))
-            if item.get("quantity", 0) <= low_stock_floor:
-                add_alert(
-                    kind="low_stock",
-                    message=f"🔴 {item.get('sellerProductName')} 재고 {item.get('quantity')}개 — 발주 필요",
-                    created_at=datetime.now(KST).isoformat(),
-                    sku=item["vendorItemId"],
-                )
+        inventory_items = client.list_rocket_growth_inventory()
+        log.append(f"ℹ️ 로켓그로스 재고 {len(inventory_items)}건 수집")
     except CoupangClientUnavailable as exc:
-        log.append(f"⚠️ 재고 수집 실패: {exc}")
+        log.append(f"⚠️ 로켓그로스 재고 수집 실패 ({exc}) — 판매자배송 재고로 재시도합니다")
+        try:
+            seller_items = client.list_seller_inventory()
+            inventory_items = [
+                {
+                    "vendorItemId": it["vendorItemId"],
+                    "sellerProductName": it.get("sellerProductName", ""),
+                    "quantity": it.get("quantity", 0),
+                }
+                for it in seller_items
+            ]
+            log.append(f"ℹ️ 판매자배송 재고 {len(inventory_items)}건으로 대체 수집")
+        except CoupangClientUnavailable as exc2:
+            log.append(
+                f"❌ 판매자배송 재고도 실패: {exc2}\n"
+                "→ 점검 순서: ① 쿠팡윙 개발자센터에서 이 액세스키에 "
+                "'재고 조회' 권한이 켜져 있는지 ② 로켓그로스 상품이 아닌데 "
+                "로켓그로스 API를 호출한 건 아닌지 ③ VENDOR_ID 오타 여부"
+            )
+
+    low_stock_floor = int(get_setting("low_stock_floor", "5"))
+    for item in inventory_items:
+        upsert_inventory(
+            sku=item["vendorItemId"],
+            product_name=item.get("sellerProductName", ""),
+            coupang_qty=item.get("quantity", 0),
+            office_qty=0,
+            updated_at=datetime.now(KST).isoformat(),
+        )
+        if item.get("quantity", 0) <= low_stock_floor:
+            add_alert(
+                kind="low_stock",
+                message=f"🔴 {item.get('sellerProductName')} 재고 {item.get('quantity')}개 — 발주 필요",
+                created_at=datetime.now(KST).isoformat(),
+                sku=item["vendorItemId"],
+            )
 
     log.append(f"✅ {target_date} 동기화 완료 — SKU {len(all_skus)}개 처리")
     return "\n".join(log)
