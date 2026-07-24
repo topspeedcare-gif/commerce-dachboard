@@ -26,6 +26,7 @@ from shared.db import (
     get_setting,
     set_setting,
 )
+from dashboard.seed_demo import seed_demo_data
 
 st.set_page_config(page_title="TOPSPEED 대시보드", layout="wide")
 init_db()
@@ -86,6 +87,16 @@ tab_dash, tab_input, tab_inv, tab_settings = st.tabs(
 
 # 1) 대시보드 — 실데이터 조회
 with tab_dash:
+    with get_conn() as _c:
+        _has_data = _c.execute("SELECT 1 FROM daily_metrics LIMIT 1").fetchone()
+
+    if not _has_data:
+        st.warning("아직 데이터가 없습니다. 실제 쿠팡 연동 전, 샘플 데이터로 먼저 둘러보시겠어요?")
+        if st.button("🧪 샘플 데이터로 체험하기"):
+            msg = seed_demo_data()
+            st.success(msg)
+            st.rerun()
+
     col1, col2 = st.columns(2)
     start = col1.date_input("시작일", value=date.today())
     end = col2.date_input("종료일", value=date.today())
@@ -184,3 +195,13 @@ with tab_settings:
         set_setting("roas_floor", str(roas_floor))
         set_setting("low_stock_floor", str(low_stock_floor))
         st.success("임계치가 저장되었습니다. 다음 sync_job.py 실행부터 적용됩니다.")
+
+    st.divider()
+    st.subheader("⚠️ 데이터 초기화")
+    st.caption("실제 쿠팡 연동을 시작하기 전, 샘플 데이터를 지우고 싶을 때 사용하세요.")
+    if st.button("샘플/테스트 데이터 전체 삭제", type="secondary"):
+        with get_conn() as _c:
+            _c.execute("DELETE FROM daily_metrics")
+            _c.execute("DELETE FROM inventory")
+            _c.execute("DELETE FROM alerts")
+        st.success("초기화 완료. 대시보드 탭에서 새로고침 해보세요.")
