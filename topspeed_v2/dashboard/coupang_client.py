@@ -68,30 +68,23 @@ class CoupangClient:
         return str(start), str(today)
 
     # ── 상품 목록 ─────────────────────────────────────────────
-   def list_orders(
+    def list_products(
         self,
-        created_at_from: str,
-        created_at_to: str,
-        status: str = "ACCEPT",
         max_per_page: int = 50,
+        next_token: int | None = None,
+        rocket_growth: bool = False,
     ) -> dict:
-        """
-        발주서(주문) 목록 조회 — 공식 경로 확인 완료 (2026-07)
-        https://developers.coupangcorp.com 문서 기준:
-        GET /v2/providers/openapi/apis/api/v4/vendors/{vendorId}/ordersheets
-
-        status: ACCEPT(결제완료) | INSTRUCT(상품준비중) | DEPARTURE(배송지시)
-                DELIVERING(배송중) | FINAL_DELIVERY(배송완료) | NONE_TRACKING(배송없음)
-        """
-        path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/ordersheets"
-        params = {
-            "createdAtFrom": created_at_from,
-            "createdAtTo": created_at_to,
-            "status": status,
-            "maxPerPage": max(1, min(100, max_per_page)),
+        path = "/v2/providers/seller_api/apis/api/v1/marketplace/seller-products"
+        params: dict = {
+            "vendorId": self.vendor_id,
+            "maxPerPage": max(1, min(100, int(max_per_page))),
         }
+        if next_token is not None:
+            params["nextToken"] = int(next_token)
+        if rocket_growth:
+            params["businessTypes"] = "rocketGrowth"
         return self._get(path, params)
-      
+
     def list_all_products(self) -> list[dict]:
         """전체 상품 목록 페이징 수집"""
         results, next_token = [], None
@@ -113,13 +106,15 @@ class CoupangClient:
         max_per_page: int = 50,
     ) -> dict:
         """
-        주문 목록 조회
+        발주서(주문) 목록 조회 — 공식 경로 확인 완료 (2026-07)
+        https://developers.coupangcorp.com 문서 기준:
+        GET /v2/providers/openapi/apis/api/v4/vendors/{vendorId}/ordersheets
+
         status: ACCEPT(결제완료) | INSTRUCT(상품준비중) | DEPARTURE(배송지시)
                 DELIVERING(배송중) | FINAL_DELIVERY(배송완료) | NONE_TRACKING(배송없음)
         """
-        path = f"/v2/providers/seller_api/apis/api/v1/vendor-items/orders"
+        path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/ordersheets"
         params = {
-            "vendorId": self.vendor_id,
             "createdAtFrom": created_at_from,
             "createdAtTo": created_at_to,
             "status": status,
