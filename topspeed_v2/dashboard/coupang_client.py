@@ -116,6 +116,7 @@ class CoupangClient:
         created_at_to: str,
         status: str = "ACCEPT",
         max_per_page: int = 50,
+        next_token: str | int | None = None,
     ) -> dict:
         """
         발주서(주문) 목록 조회 — 공식 경로 확인 완료 (2026-07)
@@ -124,19 +125,25 @@ class CoupangClient:
 
         status: ACCEPT(결제완료) | INSTRUCT(상품준비중) | DEPARTURE(배송지시)
                 DELIVERING(배송중) | FINAL_DELIVERY(배송완료) | NONE_TRACKING(배송없음)
+
+        주의: 이 API는 maxPerPage가 최대 50까지만 허용된다 (100을 보내면
+        "max page number param should between 1~50" 400 에러가 남 —
+        실제로 매일 이 에러가 나서 매출이 하루도 안 쌓이고 있었음, 2026-07-24 확인).
         """
         path = f"/v2/providers/openapi/apis/api/v4/vendors/{self.vendor_id}/ordersheets"
         params = {
             "createdAtFrom": created_at_from,
             "createdAtTo": created_at_to,
             "status": status,
-            "maxPerPage": max(1, min(100, max_per_page)),
+            "maxPerPage": max(1, min(50, max_per_page)),
         }
+        if next_token is not None:
+            params["nextToken"] = next_token
         return self._get(path, params)
 
     def list_orders_range(self, days_back: int = 7) -> tuple[list[dict], list[str]]:
         """
-        최근 N일 전체 주문 수집 (완료 포함)
+        최근 N일 전체 주문 수집 (완료 포함, 상태별로 50건씩 페이징하며 전부 수집)
 
         반환: (주문 리스트, 에러 메시지 리스트)
         이전엔 실패를 조용히 넘어가서 "주문 0건"이 진짜 0건인지
@@ -146,12 +153,18 @@ class CoupangClient:
         all_orders: list[dict] = []
         errors: list[str] = []
         for status in ["ACCEPT", "INSTRUCT", "DEPARTURE", "DELIVERING", "FINAL_DELIVERY"]:
-            try:
-                data = self.list_orders(start, end, status=status, max_per_page=100)
+            next_token = None
+            while True:
+                try:
+                    data = self.list_orders(start, end, status=status, max_per_page=50, next_token=next_token)
+                except CoupangClientUnavailable as exc:
+                    errors.append(f"{status} 상태 조회 실패: {exc}")
+                    break
                 orders = data.get("data") or []
                 all_orders.extend(orders)
-            except CoupangClientUnavailable as exc:
-                errors.append(f"{status} 상태 조회 실패: {exc}")
+                next_token = data.get("nextToken")
+                if not orders or not next_token:
+                    break
         return all_orders, errors
 
     # ── 취소·반품 ─────────────────────────────────────────────

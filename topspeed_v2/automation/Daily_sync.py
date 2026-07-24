@@ -1,6 +1,5 @@
-
 """
-automation/daily_sync.py — 완전 자동화 스크립트
+automation/Daily_sync.py — 완전 자동화 스크립트
 
 Windows 작업 스케줄러가 매일 이 파일을 실행하면:
   1. .env에 있는 쿠팡 키로 sync_job.run_sync() 실행 (PC의 등록된 IP로 호출되므로 403 안 남)
@@ -17,6 +16,7 @@ Windows 작업 스케줄러가 매일 이 파일을 실행하면:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -30,6 +30,36 @@ KST = ZoneInfo("Asia/Seoul")
 LOG_PATH = ROOT / "automation" / "sync_log.txt"
 
 
+def find_git() -> str:
+    """
+    시스템 PATH에 git이 등록되어 있으면 그걸 쓰고,
+    없으면(흔히 GitHub Desktop만 설치하고 'Git for Windows'는 따로 설치 안 한 경우)
+    GitHub Desktop이 내장해둔 git.exe 위치를 직접 찾아본다.
+    """
+    found = shutil.which("git")
+    if found:
+        return found
+
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "GitHubDesktop",
+    ]
+    for base in candidates:
+        if not base.exists():
+            continue
+        for git_path in base.rglob("mingw64/bin/git.exe"):
+            return str(git_path)
+        for git_path in base.rglob("git.exe"):
+            return str(git_path)
+
+    raise FileNotFoundError(
+        "git.exe를 찾을 수 없습니다. https://git-scm.com/download/win 에서 "
+        "'Git for Windows'를 설치하시면 (기본 옵션 그대로) 해결됩니다."
+    )
+
+
+GIT_EXE = None  # main()에서 채워짐
+
+
 def log(msg: str) -> None:
     line = f"[{datetime.now(KST).isoformat(timespec='seconds')}] {msg}"
     print(line)
@@ -39,12 +69,28 @@ def log(msg: str) -> None:
 
 def run_git(*args: str) -> tuple[int, str]:
     result = subprocess.run(
-        ["git", *args], cwd=ROOT, capture_output=True, text=True
+        [GIT_EXE, *args], cwd=ROOT, capture_output=True, text=True
     )
     return result.returncode, (result.stdout + result.stderr).strip()
 
 
 def main() -> None:
+    global GIT_EXE
+    # Windows 콘솔 기본 인코딩(cp949)은 이모지(✅❌⚠️)를 못 담아서 그냥 실행하면
+    # 작업 스케줄러가 매번 UnicodeEncodeError로 죽는다 — UTF-8로 강제한다.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        GIT_EXE = find_git()
+        log(f"git 위치 확인: {GIT_EXE}")
+    except FileNotFoundError as exc:
+        log(f"❌ {exc}")
+        return
+
     try:
         from dotenv import load_dotenv
         load_dotenv(ROOT / ".env")

@@ -176,6 +176,20 @@ def run_sync(
 
 
 if __name__ == "__main__":
+    # Windows 콘솔 기본 인코딩(cp949)은 이모지(✅❌⚠️)를 못 담아서 그냥 실행하면
+    # UnicodeEncodeError로 죽는다 — 실제로 확인된 문제라 표준출력을 UTF-8로 강제한다.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    except ImportError:
+        pass  # python-dotenv 없으면 시스템 환경변수만 사용
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=None, help="yyyy-MM-dd (기본: 어제)")
     parser.add_argument("--unit-cost-file", default=None, help="SKU별 원가 JSON 파일 경로")
