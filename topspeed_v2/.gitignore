@@ -1,0 +1,7 @@
+.env
+.streamlit/secrets.toml
+*.db
+!shared/topspeed.db
+__pycache__/
+*.pyc
+automation/sync_log.txt
