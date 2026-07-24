@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import urllib.error
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -56,6 +57,17 @@ class CoupangClient:
         try:
             with urlopen(req, timeout=20) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # 쿠팡이 응답 본문에 실제 사유를 담아 보내는 경우가 많음 (예: 잘못된 status 값,
+            # 조회 기간 초과 등) — 예전엔 이 본문을 버리고 "400 Bad Request"만 보여줘서
+            # 정확히 뭐가 문제인지 알 수 없었음. 이제 본문까지 그대로 보여준다.
+            try:
+                body = exc.read().decode("utf-8")[:300]
+            except Exception:
+                body = ""
+            raise CoupangClientUnavailable(
+                f"쿠팡 API 호출 실패: HTTP {exc.code} {exc.reason} — {body}"
+            ) from exc
         except Exception as exc:
             raise CoupangClientUnavailable(f"쿠팡 API 호출 실패: {exc}") from exc
 
