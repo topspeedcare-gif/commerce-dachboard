@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS experiments (
     status          TEXT NOT NULL DEFAULT 'running',
     created_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS inventory_moves (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku             TEXT NOT NULL,
+    move_type       TEXT NOT NULL,
+    quantity        INTEGER NOT NULL,
+    channel         TEXT,
+    note            TEXT,
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -198,6 +208,119 @@ def update_experiment_status(experiment_id: int, status: str) -> None:
             "UPDATE experiments SET status = ? WHERE id = ?",
             (status, experiment_id),
         )
+
+
+class InsufficientStockError(Exception):
+    """사무실 재고가 부족해서 이관/출고 이동을 처리할 수 없을 때."""
+
+
+_INVENTORY_MOVE_TYPES = {"inbound", "transfer_to_coupang", "outbound_other", "adjustment"}
+LOW_OFFICE_STOCK_FLOOR_DEFAULT = 10
+
+
+def add_inventory_move(
+    sku: str,
+    move_type: str,
+    quantity: int,
+    created_at: str,
+    channel: str | None = None,
+    note: str | None = None,
+) -> None:
+    """
+    재고 이동 1건을 기록하고, move_type에 따라 inventory 테이블의
+    office_qty/coupang_qty를 함께 갱신한다.
+
+      - inbound:              office_qty += quantity
+      - transfer_to_coupang:  office_qty -= quantity, coupang_qty += quantity
+      - outbound_other:       office_qty -= quantity  (channel에 출고 채널 기록)
+      - adjustment:           office_qty += quantity  (음수 가능 — 실사 보정용)
+
+    transfer_to_coupang / outbound_other는 office_qty가 quantity보다 적으면
+    InsufficientStockError를 던지고 아무것도 반영하지 않는다.
+    office_qty가 낮은 재고 임계치(low_office_stock_floor 설정값, 기본 10) 이하로
+    떨어지면 'low_office_stock' 알람을 함께 남긴다.
+    """
+    if move_type not in _INVENTORY_MOVE_TYPES:
+        raise ValueError(f"알 수 없는 move_type: {move_type!r} (허용: {sorted(_INVENTORY_MOVE_TYPES)})")
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT product_name, coupang_qty, office_qty FROM inventory WHERE sku = ?", (sku,)
+        ).fetchone()
+        product_name = row["product_name"] if row else ""
+        coupang_qty = row["coupang_qty"] if row else 0
+        office_qty = row["office_qty"] if row else 0
+
+        if move_type == "inbound":
+            office_qty += quantity
+        elif move_type == "transfer_to_coupang":
+            if office_qty < quantity:
+                raise InsufficientStockError(
+                    f"{sku} 사무실 재고 부족: 현재 {office_qty}개, 쿠팡 이관 요청 {quantity}개"
+                )
+            office_qty -= quantity
+            coupang_qty += quantity
+        elif move_type == "outbound_other":
+            if office_qty < quantity:
+                raise InsufficientStockError(
+                    f"{sku} 사무실 재고 부족: 현재 {office_qty}개, 출고 요청 {quantity}개"
+                )
+            office_qty -= quantity
+        elif move_type == "adjustment":
+            office_qty += quantity  # quantity는 음수도 허용 (실사 보정)
+
+        conn.execute(
+            """
+            INSERT INTO inventory (sku, product_name, coupang_qty, office_qty, updated_at)
+            VALUES (:sku, :product_name, :coupang_qty, :office_qty, :updated_at)
+            ON CONFLICT(sku) DO UPDATE SET
+                coupang_qty=excluded.coupang_qty,
+                office_qty=excluded.office_qty,
+                updated_at=excluded.updated_at
+            """,
+            {
+                "sku": sku,
+                "product_name": product_name,
+                "coupang_qty": coupang_qty,
+                "office_qty": office_qty,
+                "updated_at": created_at,
+            },
+        )
+
+        conn.execute(
+            "INSERT INTO inventory_moves (sku, move_type, quantity, channel, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sku, move_type, quantity, channel, note, created_at),
+        )
+
+        if move_type in {"transfer_to_coupang", "outbound_other"}:
+            floor_setting = conn.execute(
+                "SELECT value FROM settings WHERE key = 'low_office_stock_floor'"
+            ).fetchone()
+            floor = int(floor_setting["value"]) if floor_setting else LOW_OFFICE_STOCK_FLOOR_DEFAULT
+            if office_qty <= floor:
+                conn.execute(
+                    "INSERT INTO alerts (created_at, kind, sku, message) VALUES (?, ?, ?, ?)",
+                    (
+                        created_at,
+                        "low_office_stock",
+                        sku,
+                        f"🔴 {product_name or sku} 사무실 재고 {office_qty}개 — 입고 필요",
+                    ),
+                )
+
+
+def get_inventory_moves(sku: str | None = None, limit: int = 20) -> list[sqlite3.Row]:
+    """재고 이동 이력 조회. sku를 안 주면 전체 SKU의 최근 이동 이력."""
+    with get_conn() as conn:
+        if sku:
+            return conn.execute(
+                "SELECT * FROM inventory_moves WHERE sku = ? ORDER BY id DESC LIMIT ?",
+                (sku, limit),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM inventory_moves ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
 
 
 if __name__ == "__main__":
