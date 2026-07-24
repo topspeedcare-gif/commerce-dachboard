@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # 명령어 그룹들 — 새 그룹 추가 시 여기에 한 줄만 추가
 from assistant import commands_coupang  # noqa: F401
+from assistant import commands_inventory  # noqa: F401
 
 from assistant.dispatcher import dispatch, registered_commands
 
