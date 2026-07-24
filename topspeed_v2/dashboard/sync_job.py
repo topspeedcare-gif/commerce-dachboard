@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dashboard.calc import calc_daily_metric, detect_ad_issue
 from dashboard.coupang_client import CoupangClient, CoupangClientUnavailable
 from dashboard.coupang_ads_client import CoupangAdsClient, CoupangAdsUnavailable
-from shared.db import init_db, upsert_daily_metric, upsert_inventory, add_alert
+from shared.db import init_db, upsert_daily_metric, upsert_inventory, add_alert, get_setting
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -39,18 +39,34 @@ def load_unit_costs(path: str | None) -> dict[str, int]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def run_sync(target_date: str, unit_costs: dict[str, int]) -> None:
-    init_db()
+def run_sync(
+    target_date: str,
+    unit_costs: dict[str, int],
+    access_key: str | None = None,
+    secret_key: str | None = None,
+    vendor_id: str | None = None,
+    ads_access: str | None = None,
+    ads_secret: str | None = None,
+    ads_account: str | None = None,
+) -> str:
+    """
+    쿠팡 API 키를 인자로 직접 받을 수도, 환경변수(.env)에서 읽을 수도 있음.
+    → CLI(`python sync_job.py`)와 웹앱(web_app.py의 "지금 동기화" 버튼)이
+      같은 함수를 공유해서 쓸 수 있게 하기 위함. 로직이 두 군데로 갈라지지 않음.
 
-    access_key = os.getenv("COUPANG_ACCESS_KEY", "")
-    secret_key = os.getenv("COUPANG_SECRET_KEY", "")
-    vendor_id = os.getenv("COUPANG_VENDOR_ID", "")
+    반환값: 사람이 읽는 결과 요약 문자열 (성공/실패 모두 포함, 예외를 던지지 않음)
+    """
+    init_db()
+    log: list[str] = []
+
+    access_key = access_key or os.getenv("COUPANG_ACCESS_KEY", "")
+    secret_key = secret_key or os.getenv("COUPANG_SECRET_KEY", "")
+    vendor_id = vendor_id or os.getenv("COUPANG_VENDOR_ID", "")
 
     try:
         client = CoupangClient(access_key, secret_key, vendor_id)
     except CoupangClientUnavailable as exc:
-        print(f"❌ 쿠팡 오픈API 미연결: {exc}")
-        return
+        return f"❌ 쿠팡 오픈API 미연결: {exc}"
 
     # 1. 주문 데이터 수집 → SKU별 집계
     orders = client.list_orders_range(days_back=1)
@@ -65,9 +81,9 @@ def run_sync(target_date: str, unit_costs: dict[str, int]) -> None:
 
     # 2. 광고 데이터 수집 (키 없으면 0으로 처리하고 진행 — 대시보드는 항상 떠야 함)
     ad_by_sku: dict[str, dict] = defaultdict(lambda: {"impressions": 0, "clicks": 0, "spend": 0})
-    ads_access = os.getenv("COUPANG_ADS_ACCESS_KEY", "")
-    ads_secret = os.getenv("COUPANG_ADS_SECRET_KEY", "")
-    ads_account = os.getenv("COUPANG_ADS_ACCOUNT_ID", "")
+    ads_access = ads_access or os.getenv("COUPANG_ADS_ACCESS_KEY", "")
+    ads_secret = ads_secret or os.getenv("COUPANG_ADS_SECRET_KEY", "")
+    ads_account = ads_account or os.getenv("COUPANG_ADS_ACCOUNT_ID", "")
     if ads_access and ads_secret and ads_account:
         try:
             ads_client = CoupangAdsClient(ads_access, ads_secret, ads_account)
@@ -78,15 +94,19 @@ def run_sync(target_date: str, unit_costs: dict[str, int]) -> None:
                 ad_by_sku[sku]["clicks"] += int(row.get("clicks", 0))
                 ad_by_sku[sku]["spend"] += int(row.get("spend", 0))
         except CoupangAdsUnavailable as exc:
-            print(f"⚠️ 광고 데이터 수집 실패 (매출 계산은 계속 진행): {exc}")
+            log.append(f"⚠️ 광고 데이터 수집 실패 (매출 계산은 계속 진행): {exc}")
     else:
-        print("ℹ️ 광고 API 키 미설정 — 광고 지표 없이 매출/재고만 동기화합니다.")
+        log.append("ℹ️ 광고 API 키 미설정 — 광고 지표 없이 매출/재고만 동기화합니다.")
 
     # 3. SKU별 계산 + 저장 + 알람
     all_skus = set(per_sku_sales) | set(ad_by_sku)
     for sku in all_skus:
         sales = per_sku_sales.get(sku, {"qty": 0, "revenue": 0})
         ads = ad_by_sku.get(sku, {"impressions": 0, "clicks": 0, "spend": 0})
+
+        # 원가: 대시보드 설정 화면에서 저장한 값(setting) 우선, 없으면 json 파일값
+        db_cost = get_setting(f"unit_cost:{sku}", "")
+        unit_cost = int(db_cost) if db_cost else unit_costs.get(sku, 0)
 
         metric = calc_daily_metric(
             date=target_date,
@@ -96,11 +116,12 @@ def run_sync(target_date: str, unit_costs: dict[str, int]) -> None:
             ad_impressions=ads["impressions"],
             ad_clicks=ads["clicks"],
             ad_spend=ads["spend"],
-            unit_cost=unit_costs.get(sku, 0),
+            unit_cost=unit_cost,
         )
         upsert_daily_metric(metric)
 
-        issue = detect_ad_issue(metric)
+        roas_floor = float(get_setting("roas_floor", "1.5"))
+        issue = detect_ad_issue(metric, roas_floor=roas_floor)
         if issue:
             add_alert(kind="ad_issue", message=issue, created_at=datetime.now(KST).isoformat(), sku=sku)
 
@@ -115,7 +136,8 @@ def run_sync(target_date: str, unit_costs: dict[str, int]) -> None:
                 office_qty=0,
                 updated_at=datetime.now(KST).isoformat(),
             )
-            if item.get("quantity", 0) <= 5:
+            low_stock_floor = int(get_setting("low_stock_floor", "5"))
+            if item.get("quantity", 0) <= low_stock_floor:
                 add_alert(
                     kind="low_stock",
                     message=f"🔴 {item.get('sellerProductName')} 재고 {item.get('quantity')}개 — 발주 필요",
@@ -123,9 +145,10 @@ def run_sync(target_date: str, unit_costs: dict[str, int]) -> None:
                     sku=item["vendorItemId"],
                 )
     except CoupangClientUnavailable as exc:
-        print(f"⚠️ 재고 수집 실패: {exc}")
+        log.append(f"⚠️ 재고 수집 실패: {exc}")
 
-    print(f"✅ {target_date} 동기화 완료 — SKU {len(all_skus)}개 처리")
+    log.append(f"✅ {target_date} 동기화 완료 — SKU {len(all_skus)}개 처리")
+    return "\n".join(log)
 
 
 if __name__ == "__main__":
@@ -136,4 +159,4 @@ if __name__ == "__main__":
 
     date = args.date or str(datetime.now(KST).date() - timedelta(days=1))
     costs = load_unit_costs(args.unit_cost_file)
-    run_sync(date, costs)
+    print(run_sync(date, costs))
