@@ -28,6 +28,7 @@ from shared.db import (
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
+from dashboard.coupang_client import CoupangClient, CoupangClientUnavailable
 
 st.set_page_config(page_title="TOPSPEED 대시보드", layout="wide")
 init_db()
@@ -190,6 +191,32 @@ with tab_settings:
             ads_account = ac3.text_input("ADS_ACCOUNT_ID")
 
         sync_submitted = st.form_submit_button("지금 동기화 실행")
+
+    diag_col, _ = st.columns([1, 3])
+    if diag_col.button("🔍 연결만 먼저 진단하기"):
+        if not (access_key and secret_key and vendor_id):
+            st.error("진단하려면 위 3개 키를 먼저 입력하세요.")
+        else:
+            with st.spinner("진단 중..."):
+                try:
+                    diag_client = CoupangClient(access_key, secret_key, vendor_id)
+                    basic = diag_client.diagnose()
+                    st.write("**기본 상품 조회 (인증 검증용)**", basic)
+
+                    try:
+                        rg = diag_client.list_rocket_growth_inventory()
+                        st.write(f"✅ 로켓그로스 재고 API: 정상 ({len(rg)}건)")
+                    except CoupangClientUnavailable as exc:
+                        st.write(f"❌ 로켓그로스 재고 API 실패: `{exc}`")
+
+                    try:
+                        sl = diag_client.list_seller_inventory()
+                        st.write(f"✅ 판매자배송 재고 API: 정상 ({len(sl)}건)")
+                    except CoupangClientUnavailable as exc:
+                        st.write(f"❌ 판매자배송 재고 API 실패: `{exc}`")
+
+                except CoupangClientUnavailable as exc:
+                    st.error(f"기본 연결부터 실패: {exc}")
 
     if sync_submitted:
         if not (access_key and secret_key and vendor_id):
