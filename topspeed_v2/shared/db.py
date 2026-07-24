@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS settings (
     key             TEXT PRIMARY KEY,
     value           TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS experiments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku             TEXT NOT NULL,
+    hypothesis      TEXT NOT NULL,
+    start_date      TEXT NOT NULL,
+    review_date     TEXT NOT NULL,
+    metric_type     TEXT NOT NULL,
+    target_value    REAL NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'running',
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -137,6 +149,54 @@ def set_setting(key: str, value: str) -> None:
             "INSERT INTO settings (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
+        )
+
+
+def add_experiment(
+    sku: str,
+    hypothesis: str,
+    start_date: str,
+    review_date: str,
+    metric_type: str,
+    target_value: float,
+    created_at: str,
+) -> int:
+    """실험을 하나 등록하고 새로 생성된 id를 반환한다. status는 항상 'running'으로 시작."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO experiments
+                (sku, hypothesis, start_date, review_date, metric_type, target_value, status, created_at)
+            VALUES (:sku, :hypothesis, :start_date, :review_date, :metric_type, :target_value, 'running', :created_at)
+            """,
+            {
+                "sku": sku,
+                "hypothesis": hypothesis,
+                "start_date": start_date,
+                "review_date": review_date,
+                "metric_type": metric_type,
+                "target_value": target_value,
+                "created_at": created_at,
+            },
+        )
+        return int(cur.lastrowid)
+
+
+def get_due_experiments() -> list[sqlite3.Row]:
+    """판정 예정일이 오늘이거나 지났는데 아직 status='running'인 실험 목록."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM experiments "
+            "WHERE status = 'running' AND review_date <= date('now', 'localtime') "
+            "ORDER BY review_date"
+        ).fetchall()
+
+
+def update_experiment_status(experiment_id: int, status: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE experiments SET status = ? WHERE id = ?",
+            (status, experiment_id),
         )
 
 
