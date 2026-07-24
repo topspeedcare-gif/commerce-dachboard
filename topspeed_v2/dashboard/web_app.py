@@ -27,6 +27,7 @@ from shared.db import (
     set_setting,
 )
 from dashboard.seed_demo import seed_demo_data
+from dashboard.sync_job import run_sync
 
 st.set_page_config(page_title="TOPSPEED 대시보드", layout="wide")
 init_db()
@@ -171,6 +172,46 @@ with tab_inv:
 
 # 4) 설정 — 원가·알람 임계치
 with tab_settings:
+    st.subheader("🔗 쿠팡 실시간 연동")
+    st.caption(
+        "API 키를 입력하고 동기화하면 오늘 날짜 기준으로 매출·재고를 바로 가져옵니다. "
+        "키는 저장되지 않고 이번 세션에서만 사용됩니다."
+    )
+    with st.form("live_sync_form"):
+        c1, c2, c3 = st.columns(3)
+        access_key = c1.text_input("COUPANG_ACCESS_KEY", type="password")
+        secret_key = c2.text_input("COUPANG_SECRET_KEY", type="password")
+        vendor_id = c3.text_input("COUPANG_VENDOR_ID")
+
+        with st.expander("광고 API 키 (선택 — 발급받으셨다면)"):
+            ac1, ac2, ac3 = st.columns(3)
+            ads_access = ac1.text_input("ADS_ACCESS_KEY", type="password")
+            ads_secret = ac2.text_input("ADS_SECRET_KEY", type="password")
+            ads_account = ac3.text_input("ADS_ACCOUNT_ID")
+
+        sync_submitted = st.form_submit_button("지금 동기화 실행")
+
+    if sync_submitted:
+        if not (access_key and secret_key and vendor_id):
+            st.error("쿠팡 오픈API 키 3개(ACCESS/SECRET/VENDOR)는 필수입니다.")
+        else:
+            with st.spinner("쿠팡 데이터 가져오는 중..."):
+                today_str = str(date.today())
+                result = run_sync(
+                    target_date=today_str,
+                    unit_costs={},
+                    access_key=access_key,
+                    secret_key=secret_key,
+                    vendor_id=vendor_id,
+                    ads_access=ads_access or None,
+                    ads_secret=ads_secret or None,
+                    ads_account=ads_account or None,
+                )
+            st.code(result)
+            if result.startswith("✅") or "완료" in result:
+                st.success("동기화 완료! 📊 대시보드 탭에서 확인하세요.")
+
+    st.divider()
     st.subheader("SKU별 원가 설정")
     with st.form("cost_form"):
         cost_sku = st.text_input("SKU")
