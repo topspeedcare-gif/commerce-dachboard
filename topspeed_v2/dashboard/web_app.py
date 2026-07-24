@@ -10,7 +10,7 @@ dashboard/web_app.py — TOPSPEED 웹 대시보드 (4단계: 배포 가능한 �
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -25,6 +25,8 @@ from shared.db import (
     add_alert,
     get_setting,
     set_setting,
+    add_experiment,
+    update_experiment_status,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
@@ -82,9 +84,40 @@ def fetch_alerts(limit: int = 20) -> list[dict]:
         ]
 
 
+def fetch_running_experiments() -> list[dict]:
+    with get_conn() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM experiments WHERE status = 'running' ORDER BY review_date"
+            ).fetchall()
+        ]
+
+
+# 비율 지표는 기간 평균, 누적 지표는 기간 합산이 의미가 맞다.
+_EXPERIMENT_RATE_METRICS = {"roas", "ctr", "cvr"}
+_EXPERIMENT_METRIC_COLUMNS = {
+    "roas", "ctr", "cvr", "revenue", "sales_qty", "net_profit", "ad_spend",
+}
+
+
+def fetch_experiment_actual(sku: str, start_date: str, metric_type: str) -> float | None:
+    """실험 시작일부터 오늘까지 daily_metrics에서 실제 지표 실적을 계산한다."""
+    if metric_type not in _EXPERIMENT_METRIC_COLUMNS:
+        return None
+    agg = "AVG" if metric_type in _EXPERIMENT_RATE_METRICS else "SUM"
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT {agg}({metric_type}) AS v FROM daily_metrics "
+            "WHERE sku = ? AND date >= ? AND date <= date('now', 'localtime')",
+            (sku, start_date),
+        ).fetchone()
+    return row["v"] if row and row["v"] is not None else None
+
+
 # ── 탭 구성 ────────────────────────────────────────────────
-tab_dash, tab_input, tab_inv, tab_settings = st.tabs(
-    ["📊 대시보드", "📝 일 마감 입력", "📦 재고 관리", "⚙️ 설정"]
+tab_dash, tab_input, tab_inv, tab_exp, tab_settings = st.tabs(
+    ["📊 대시보드", "📝 일 마감 입력", "📦 재고 관리", "🧪 실험 관리", "⚙️ 설정"]
 )
 
 # 1) 대시보드 — 실데이터 조회
@@ -171,7 +204,66 @@ with tab_inv:
         st.rerun()
 
 
-# 4) 설정 — 원가·알람 임계치
+# 4) 실험 관리 — 신상품/광고 테스트 가설 등록·판정
+with tab_exp:
+    st.write("신상품·광고 테스트를 시작할 때 가설(기준치)을 기록해두고, 판정 예정일이 지나면 실제 성과와 비교합니다.")
+
+    with st.form("experiment_form"):
+        exp_sku = st.text_input("SKU")
+        exp_hypothesis = st.text_area("가설", placeholder="예: 신규 패드 적용 시 ROAS 2.0 이상 나올 것")
+        c1, c2, c3 = st.columns(3)
+        exp_metric = c1.selectbox("기준 지표", sorted(_EXPERIMENT_METRIC_COLUMNS))
+        exp_target = c2.number_input("목표치", min_value=0.0, step=0.1)
+        exp_review = c3.date_input("판정 예정일", value=date.today() + timedelta(days=14))
+        exp_submitted = st.form_submit_button("실험 등록")
+
+    if exp_submitted:
+        if not exp_sku or not exp_hypothesis:
+            st.error("SKU와 가설은 필수입니다.")
+        else:
+            add_experiment(
+                sku=exp_sku,
+                hypothesis=exp_hypothesis,
+                start_date=str(date.today()),
+                review_date=str(exp_review),
+                metric_type=exp_metric,
+                target_value=float(exp_target),
+                created_at=datetime.now().isoformat(),
+            )
+            st.success(f"{exp_sku} 실험 등록 완료 (판정 예정일: {exp_review})")
+            st.rerun()
+
+    st.divider()
+    st.subheader("진행 중인 실험")
+    running = fetch_running_experiments()
+    if not running:
+        st.write("진행 중인 실험이 없습니다.")
+    else:
+        today_str = str(date.today())
+        for exp in running:
+            actual = fetch_experiment_actual(exp["sku"], exp["start_date"], exp["metric_type"])
+            overdue = exp["review_date"] <= today_str
+            actual_text = f"{actual:.2f}" if actual is not None else "데이터 없음"
+            verdict = ""
+            if actual is not None:
+                verdict = " · ✅ 목표 달성" if actual >= exp["target_value"] else " · ⚠️ 목표 미달"
+            title = (
+                f"{'🔴 [판정 필요] ' if overdue else ''}"
+                f"{exp['sku']} — {exp['metric_type'].upper()} 목표 {exp['target_value']} / 실제 {actual_text}{verdict}"
+            )
+            with st.expander(title, expanded=overdue):
+                st.write(f"**가설:** {exp['hypothesis']}")
+                st.write(f"시작일: `{exp['start_date']}` · 판정 예정일: `{exp['review_date']}`")
+                bcol1, bcol2 = st.columns(2)
+                if bcol1.button("✅ 계속 진행", key=f"exp_continue_{exp['id']}"):
+                    update_experiment_status(exp["id"], "decided_continue")
+                    st.rerun()
+                if bcol2.button("🛑 중단", key=f"exp_stop_{exp['id']}"):
+                    update_experiment_status(exp["id"], "decided_stop")
+                    st.rerun()
+
+
+# 5) 설정 — 원가·알람 임계치
 with tab_settings:
     st.subheader("🔗 쿠팡 실시간 연동")
     st.caption(
