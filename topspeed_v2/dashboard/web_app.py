@@ -33,6 +33,7 @@ from shared.db import (
     get_stock_predictions,
     get_reorder_suggestions,
     REORDER_LEAD_TIME_DAYS_DEFAULT,
+    get_rocket_growth_revenue_estimate,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
@@ -152,7 +153,7 @@ with tab_dash:
         total_ad = sum(r["ad_spend"] for r in rows)
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("매출", f"{total_revenue:,}원")
+        m1.metric("매출 (판매자배송)", f"{total_revenue:,}원")
         m2.metric("실손익", f"{total_profit:,}원")
         m3.metric("광고비", f"{total_ad:,}원")
 
@@ -161,6 +162,21 @@ with tab_dash:
 
         st.subheader("일별 매출 추이")
         st.bar_chart({r["date"]: r["revenue"] for r in rows})
+
+    st.subheader("🚀 로켓그로스 추정 매출")
+    st.caption(
+        "쿠팡 공식 API는 로켓그로스 매출을 실시간으로 안 줘서(정산 확정까지 9일+ 지연), "
+        "최근 30일 판매속도 x 판매가로 추정한 값입니다. 정확한 당일 매출이 아닙니다."
+    )
+    rg_estimate = get_rocket_growth_revenue_estimate()
+    if not rg_estimate["items"]:
+        st.write("추정할 데이터가 없습니다 (쿠팡 동기화를 먼저 실행하세요).")
+    else:
+        rc1, rc2 = st.columns(2)
+        rc1.metric("추정 일평균 매출", f"약 {rg_estimate['total_estimated_daily_revenue']:,}원")
+        rc2.metric("추정 일평균 판매량", f"약 {rg_estimate['total_estimated_daily_qty']}개")
+        with st.expander("SKU별 추정 매출 보기"):
+            st.dataframe(rg_estimate["items"], use_container_width=True)
 
     st.subheader("🔔 최근 알람")
     alerts = fetch_alerts()

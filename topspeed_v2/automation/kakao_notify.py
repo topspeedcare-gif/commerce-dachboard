@@ -25,7 +25,13 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv, set_key
 
-from shared.db import get_conn, get_due_experiments, get_setting, LOW_OFFICE_STOCK_FLOOR_DEFAULT
+from shared.db import (
+    get_conn,
+    get_due_experiments,
+    get_setting,
+    LOW_OFFICE_STOCK_FLOOR_DEFAULT,
+    get_rocket_growth_revenue_estimate,
+)
 
 TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
@@ -130,11 +136,20 @@ def build_daily_summary(target_date: str | None = None) -> str:
         net_profit = sum(r["net_profit"] for r in rows)
         roas = round(revenue / ad_spend, 2) if ad_spend else 0.0
         lines += [
-            f"매출: {revenue:,}원",
+            f"매출: {revenue:,}원 (판매자배송 기준 — 로켓그로스는 아래 별도)",
             f"광고비: {ad_spend:,}원",
             f"ROAS: {roas}",
             f"순이익: {net_profit:,}원",
         ]
+
+    rg_estimate = get_rocket_growth_revenue_estimate()
+    if rg_estimate["items"]:
+        lines.append("")
+        lines.append(
+            f"🚀 로켓그로스 추정 일평균 매출: 약 {rg_estimate['total_estimated_daily_revenue']:,}원 "
+            f"(최근 30일 판매속도 x 판매가 기준 추정치, 정확한 당일 매출 아님)"
+        )
+        lines.append(f"  · 추정 일평균 판매량: 약 {rg_estimate['total_estimated_daily_qty']}개")
 
     due_experiments = get_due_experiments()
     if due_experiments:

@@ -446,6 +446,45 @@ def get_reorder_suggestions(
     return suggestions
 
 
+def get_rocket_growth_revenue_estimate() -> dict:
+    """
+    inventory.sales_velocity_30d(최근 30일 평균 일일 판매량) x unit_price로
+    SKU별 "추정 일평균 매출"을 계산한다.
+
+    로켓그로스 매출은 쿠팡 공식 API로 정확한 "어제 매출"을 못 받아온다
+    (주문서 API엔 거의 안 잡히고, 매출인식 API는 확정까지 ~9일 지연됨 —
+    2026-07-25 실측 확인). 이건 그 공백을 메우는 대체 추정치이므로,
+    호출하는 쪽(카톡 요약/대시보드)에서 반드시 "추정치"라고 표시해야 한다.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT sku, product_name, sales_velocity_30d, unit_price FROM inventory "
+            "WHERE sales_velocity_30d > 0 AND unit_price > 0"
+        ).fetchall()
+
+    items = []
+    total_revenue = 0.0
+    total_qty = 0.0
+    for r in rows:
+        est_revenue = r["sales_velocity_30d"] * r["unit_price"]
+        total_revenue += est_revenue
+        total_qty += r["sales_velocity_30d"]
+        items.append({
+            "sku": r["sku"],
+            "product_name": r["product_name"],
+            "daily_velocity": round(r["sales_velocity_30d"], 2),
+            "unit_price": r["unit_price"],
+            "estimated_daily_revenue": round(est_revenue),
+        })
+    items.sort(key=lambda x: x["estimated_daily_revenue"], reverse=True)
+
+    return {
+        "total_estimated_daily_revenue": round(total_revenue),
+        "total_estimated_daily_qty": round(total_qty, 1),
+        "items": items,
+    }
+
+
 if __name__ == "__main__":
     init_db()
     print(f"DB 초기화 완료: {DB_PATH}")
