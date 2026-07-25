@@ -323,6 +323,86 @@ def get_inventory_moves(sku: str | None = None, limit: int = 20) -> list[sqlite3
         ).fetchall()
 
 
+REORDER_LEAD_TIME_DAYS_DEFAULT = 14
+REORDER_SAFETY_DAYS_DEFAULT = 7
+
+
+def get_stock_predictions(velocity_days: int = 14) -> list[dict]:
+    """
+    SKU별 최근 velocity_days일 평균 판매량(일일 판매속도)과 현재 재고
+    (쿠팡+사무실 합계)로 예상 품절일수(stock_days)를 계산한다.
+    판매 이력이 없는 SKU는 stock_days=None (예측 불가 — 무한대로 취급하지 않고
+    "판단할 데이터가 없다"는 뜻으로 명확히 구분한다).
+
+    반환: stock_days가 가장 임박한(작은) 순으로 정렬된 리스트.
+    각 항목: sku, product_name, total_qty, daily_velocity, stock_days
+    """
+    with get_conn() as conn:
+        velocity_rows = conn.execute(
+            "SELECT sku, AVG(sales_qty) AS daily_velocity FROM daily_metrics "
+            "WHERE date >= date('now', ?, 'localtime') GROUP BY sku",
+            (f"-{int(velocity_days)} days",),
+        ).fetchall()
+        inventory_rows = conn.execute(
+            "SELECT sku, product_name, coupang_qty, office_qty FROM inventory"
+        ).fetchall()
+
+    velocity_by_sku = {r["sku"]: (r["daily_velocity"] or 0.0) for r in velocity_rows}
+
+    results = []
+    for inv in inventory_rows:
+        sku = inv["sku"]
+        total_qty = inv["coupang_qty"] + inv["office_qty"]
+        velocity = velocity_by_sku.get(sku, 0.0)
+        stock_days = round(total_qty / velocity, 1) if velocity > 0 else None
+        results.append({
+            "sku": sku,
+            "product_name": inv["product_name"],
+            "total_qty": total_qty,
+            "daily_velocity": round(velocity, 2),
+            "stock_days": stock_days,
+        })
+
+    results.sort(key=lambda r: (r["stock_days"] is None, r["stock_days"] if r["stock_days"] is not None else 0))
+    return results
+
+
+def get_reorder_suggestions(
+    lead_time_days: int | None = None,
+    safety_days: int = REORDER_SAFETY_DAYS_DEFAULT,
+    velocity_days: int = 14,
+) -> list[dict]:
+    """
+    예상 품절일수가 (발주 리드타임 + 안전재고일수) 이내로 임박한 SKU에 대해
+    발주 제안 수량을 계산한다. lead_time_days를 안 주면 settings의
+    'reorder_lead_time_days'(기본 14일)를 사용한다.
+
+    suggested_order_qty = round(daily_velocity * (lead_time_days + safety_days)) - total_qty
+    (이 개수만큼 발주하면 리드타임 동안 판매속도를 버틸 수 있는 재고 + 안전 여유분이 확보됨)
+    """
+    if lead_time_days is None:
+        lead_time_days = int(get_setting("reorder_lead_time_days", str(REORDER_LEAD_TIME_DAYS_DEFAULT)))
+
+    threshold_days = lead_time_days + safety_days
+    suggestions = []
+    for pred in get_stock_predictions(velocity_days=velocity_days):
+        if pred["daily_velocity"] <= 0 or pred["stock_days"] is None:
+            continue
+        if pred["stock_days"] > threshold_days:
+            continue
+        target_qty = round(pred["daily_velocity"] * threshold_days)
+        suggested_qty = max(0, target_qty - pred["total_qty"])
+        if suggested_qty <= 0:
+            continue
+        suggestions.append({
+            **pred,
+            "lead_time_days": lead_time_days,
+            "safety_days": safety_days,
+            "suggested_order_qty": suggested_qty,
+        })
+    return suggestions
+
+
 if __name__ == "__main__":
     init_db()
     print(f"DB 초기화 완료: {DB_PATH}")
