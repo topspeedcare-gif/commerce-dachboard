@@ -12,8 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from datetime import date, timedelta
+
 from assistant.dispatcher import command
-from shared.db import get_conn, get_unsent_alerts, mark_alert_sent
+from shared.db import get_conn, get_unsent_alerts, mark_alert_sent, get_settlement_summary
 
 
 @command("오늘 매출", "쿠팡 오늘 매출", "매출 확인")
@@ -46,4 +48,26 @@ def handle_pending_alerts(ctx: dict) -> str:
     for a in alerts:
         lines.append(f"  · {a['message']}")
         mark_alert_sent(a["id"])
+    return "\n".join(lines)
+
+
+@command("정산 현황", "정산 확인")
+def handle_settlement_status(ctx: dict) -> str:
+    """
+    쿠팡이 실제로 확정한 매출인식(정산) 내역을 최근 순으로 보여준다.
+    판매일보다 약 9일 늦게 확정되어 보이므로, 최근 며칠은 안 뜨는 게 정상이다.
+    대시보드 "정산 동기화 실행" 버튼(또는 python dashboard/settlement_sync.py)을
+    먼저 실행해야 데이터가 쌓인다.
+    """
+    rows = get_settlement_summary(str(date.today() - timedelta(days=40)), str(date.today()))
+    if not rows:
+        return "📭 정산 데이터가 없습니다. 대시보드에서 '정산 동기화 실행'을 먼저 눌러주세요."
+
+    rows = sorted(rows, key=lambda r: r["sale_date"], reverse=True)
+    lines = ["💰 정산 현황 (최근 확정분 순)"]
+    for r in rows[:10]:
+        lines.append(
+            f"  · {r['sale_date']}: 매출 {round(r['sale_amount']):,}원 "
+            f"/ 정산액 {round(r['settlement_amount']):,}원 (주문 {r['order_count']}건)"
+        )
     return "\n".join(lines)

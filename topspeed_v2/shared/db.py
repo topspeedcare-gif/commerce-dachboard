@@ -76,6 +76,22 @@ CREATE TABLE IF NOT EXISTS inventory_moves (
     note            TEXT,
     created_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settlements (
+    order_id            TEXT NOT NULL,
+    sku                 TEXT NOT NULL,
+    sale_date           TEXT NOT NULL,
+    recognition_date    TEXT NOT NULL,
+    settlement_date     TEXT,
+    sale_type           TEXT,
+    product_name        TEXT,
+    quantity            REAL DEFAULT 0,
+    sale_amount         REAL DEFAULT 0,
+    fees                REAL DEFAULT 0,
+    settlement_amount   REAL DEFAULT 0,
+    synced_at           TEXT NOT NULL,
+    PRIMARY KEY (order_id, sku)
+);
 """
 
 
@@ -519,6 +535,126 @@ def get_rocket_growth_revenue_estimate() -> dict:
         "total_estimated_daily_qty": round(total_qty, 1),
         "items": items,
     }
+
+
+def upsert_settlements(raw_rows: list[dict], synced_at: str) -> int:
+    """
+    coupang_client.list_revenue_history_range()가 돌려주는 원본 레코드
+    (주문 1건 = items 여러 개)를 SKU 단위로 펼쳐서 저장한다.
+    (order_id, sku)가 기본키라 같은 주문을 여러 번 동기화해도 중복 없이 갱신된다.
+
+    saleType이 REFUND면 금액 부호를 뒤집어 저장한다 — 그래야 날짜별로
+    그냥 합산만 해도 "환불 반영된 순매출"이 나온다.
+    """
+    count = 0
+    with get_conn() as conn:
+        for row in raw_rows:
+            order_id = str(row.get("orderId") or "")
+            if not order_id:
+                continue
+            sign = -1 if str(row.get("saleType", "SALE")).upper() == "REFUND" else 1
+            for item in row.get("items") or []:
+                sku = str(item.get("vendorItemId") or "")
+                if not sku:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO settlements
+                        (order_id, sku, sale_date, recognition_date, settlement_date,
+                         sale_type, product_name, quantity, sale_amount, fees,
+                         settlement_amount, synced_at)
+                    VALUES
+                        (:order_id, :sku, :sale_date, :recognition_date, :settlement_date,
+                         :sale_type, :product_name, :quantity, :sale_amount, :fees,
+                         :settlement_amount, :synced_at)
+                    ON CONFLICT(order_id, sku) DO UPDATE SET
+                        sale_date=excluded.sale_date,
+                        recognition_date=excluded.recognition_date,
+                        settlement_date=excluded.settlement_date,
+                        sale_type=excluded.sale_type,
+                        product_name=excluded.product_name,
+                        quantity=excluded.quantity,
+                        sale_amount=excluded.sale_amount,
+                        fees=excluded.fees,
+                        settlement_amount=excluded.settlement_amount,
+                        synced_at=excluded.synced_at
+                    """,
+                    {
+                        "order_id": order_id,
+                        "sku": sku,
+                        "sale_date": row.get("saleDate", ""),
+                        "recognition_date": row.get("recognitionDate", ""),
+                        "settlement_date": row.get("settlementDate"),
+                        "sale_type": row.get("saleType", "SALE"),
+                        "product_name": item.get("vendorItemName") or item.get("productName") or "",
+                        "quantity": (item.get("quantity") or 0) * sign,
+                        "sale_amount": (item.get("saleAmount") or 0) * sign,
+                        "fees": ((item.get("serviceFee") or 0) + (item.get("serviceFeeVat") or 0)) * sign,
+                        "settlement_amount": (item.get("settlementAmount") or 0) * sign,
+                        "synced_at": synced_at,
+                    },
+                )
+                count += 1
+    return count
+
+
+def get_settlement_summary(date_from: str, date_to: str) -> list[dict]:
+    """
+    saleDate 기준으로 날짜별 정산 현황을 집계한다.
+    각 항목: sale_date, sale_amount, fees, settlement_amount, order_count
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                sale_date,
+                SUM(sale_amount) AS sale_amount,
+                SUM(fees) AS fees,
+                SUM(settlement_amount) AS settlement_amount,
+                COUNT(DISTINCT order_id) AS order_count
+            FROM settlements
+            WHERE sale_date BETWEEN ? AND ?
+            GROUP BY sale_date
+            ORDER BY sale_date
+            """,
+            (date_from, date_to),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_settlement_vs_expected(date_from: str, date_to: str) -> list[dict]:
+    """
+    날짜별로 daily_metrics(시스템이 계산한 예상 매출)와 settlements(쿠팡이
+    실제로 확정한 매출)를 나란히 비교한다.
+
+    주의: daily_metrics는 판매자배송 위주(주문서 API 기반)라 로켓그로스가
+    거의 안 잡히고, settlements는 판매유형 구분 없이 전부 잡힌다 — 그래서
+    settlement_amount가 daily_metrics.revenue보다 훨씬 큰 게 정상이다.
+    이 비교는 "완전히 같아야 한다"가 아니라 "시스템이 놓치고 있는 매출이
+    얼마나 되는지" 감을 잡기 위한 것이다.
+    """
+    with get_conn() as conn:
+        expected_rows = conn.execute(
+            "SELECT date, SUM(revenue) AS expected_revenue, SUM(net_profit) AS expected_net_profit "
+            "FROM daily_metrics WHERE date BETWEEN ? AND ? GROUP BY date",
+            (date_from, date_to),
+        ).fetchall()
+    expected_by_date = {r["date"]: dict(r) for r in expected_rows}
+
+    actual_rows = get_settlement_summary(date_from, date_to)
+    results = []
+    for row in actual_rows:
+        d = row["sale_date"]
+        expected = expected_by_date.get(d, {})
+        results.append({
+            "date": d,
+            "expected_revenue": expected.get("expected_revenue", 0) or 0,
+            "actual_sale_amount": round(row["sale_amount"] or 0),
+            "actual_settlement_amount": round(row["settlement_amount"] or 0),
+            "order_count": row["order_count"],
+        })
+    results.sort(key=lambda r: r["date"], reverse=True)
+    return results
 
 
 if __name__ == "__main__":

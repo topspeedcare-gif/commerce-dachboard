@@ -35,9 +35,11 @@ from shared.db import (
     REORDER_LEAD_TIME_DAYS_DEFAULT,
     get_rocket_growth_revenue_estimate,
     ROCKET_STOCK_ALERT_DAYS_DEFAULT,
+    get_settlement_vs_expected,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
+from dashboard.settlement_sync import run_settlement_sync
 from dashboard.coupang_client import CoupangClient, CoupangClientUnavailable
 
 st.set_page_config(page_title="TOPSPEED 대시보드", layout="wide")
@@ -178,6 +180,25 @@ with tab_dash:
         rc2.metric("추정 일평균 판매량", f"약 {rg_estimate['total_estimated_daily_qty']}개")
         with st.expander("SKU별 추정 매출 보기"):
             st.dataframe(rg_estimate["items"], use_container_width=True)
+
+    st.subheader("💰 정산 현황")
+    st.caption(
+        "쿠팡이 실제로 확정한 매출인식 내역입니다 (판매일보다 약 9일 늦게 확정되어 보입니다 — "
+        "최근 며칠은 아직 안 보이는 게 정상입니다). expected_revenue는 시스템이 계산한 예상치로, "
+        "판매자배송 위주라 로켓그로스가 섞인 실제 확정액보다 작게 나오는 게 정상입니다."
+    )
+    if st.button("🔄 정산 동기화 실행 (최근 25일)"):
+        with st.spinner("쿠팡 매출인식 내역 가져오는 중..."):
+            st.code(run_settlement_sync())
+        st.rerun()
+
+    settlement_rows = get_settlement_vs_expected(
+        str(date.today() - timedelta(days=40)), str(date.today())
+    )
+    if not settlement_rows:
+        st.write("정산 데이터가 없습니다. 위 버튼으로 먼저 동기화하세요.")
+    else:
+        st.dataframe(settlement_rows, use_container_width=True)
 
     st.subheader("🔔 최근 알람")
     alerts = fetch_alerts()

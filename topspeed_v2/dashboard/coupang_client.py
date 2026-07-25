@@ -348,29 +348,57 @@ class CoupangClient:
         return result
 
     # ── 정산 ──────────────────────────────────────────────────
-    def list_settlements(self, settlement_date: str) -> dict:
+    # 예전 list_settlements()는 /v1/settlement-reports/{date} 경로였는데
+    # 실제로 호출해보면 404("No exactly matching API specification")로 한 번도
+    # 성공한 적이 없었다 (2026-07-25 확인). 실제로 동작하는 건 매출인식(revenue-history)
+    # API다 — 대신 recognitionDate(매출이 "확정"되어 조회 가능해지는 날짜)가
+    # 실제 판매일(saleDate)보다 평균 9일 정도 늦게 뜬다는 제약이 있다
+    # (30일치 실측으로 확인됨). "어제 매출" 용도로는 못 쓰고, 정산 검증
+    # (몇 주 전 예상했던 매출이 실제로 얼마나 확정됐는지)에 적합하다.
+    def list_revenue_history(
+        self, recognition_date_from: str, recognition_date_to: str, token: str = ""
+    ) -> dict:
         """
-        정산 확정 조회 (특정 날짜)
-        settlement_date: yyyy-MM-dd
+        매출인식 내역 조회 (단일 페이지). 쿠팡 제약: 조회 기간은 1개월 미만,
+        recognitionDateTo는 어제 이전이어야 함 (오늘 지정 시 400 에러).
         """
-        path = f"/v2/providers/seller_api/apis/api/v1/settlement-reports/{settlement_date}"
-        params = {"vendorId": self.vendor_id}
+        path = "/v2/providers/openapi/apis/api/v1/revenue-history"
+        params = {
+            "vendorId": self.vendor_id,
+            "recognitionDateFrom": recognition_date_from,
+            "recognitionDateTo": recognition_date_to,
+            "maxPerPage": 50,
+            "token": token,
+        }
         return self._get(path, params)
 
-    def list_settlements_range(self, days_back: int = 30) -> list[dict]:
-        """최근 N일 정산 수집"""
-        results = []
+    def list_revenue_history_range(self, days_back: int = 25) -> tuple[list[dict], list[str]]:
+        """
+        recognitionDate 기준 최근 days_back일(기본 25일, 1개월 제약 안전 마진)치
+        매출인식 내역을 전부 페이징 수집한다.
+
+        반환: (레코드 리스트, 에러 메시지 리스트). 레코드 하나는 주문 1건 단위이며
+        saleDate·recognitionDate·settlementDate·items(SKU별 판매/정산 금액)를 담고 있다.
+        """
         today = datetime.now(KST).date()
-        for i in range(days_back):
-            d = str(today - timedelta(days=i))
+        end = today - timedelta(days=1)  # recognitionDateTo는 어제 이전만 허용
+        start = end - timedelta(days=max(1, min(27, days_back)))  # 1개월 제약 안전 마진
+
+        all_rows: list[dict] = []
+        errors: list[str] = []
+        token = ""
+        for _ in range(50):
             try:
-                data = self.list_settlements(d)
-                items = data.get("data") or []
-                if items:
-                    results.extend(items if isinstance(items, list) else [items])
-            except CoupangClientUnavailable:
-                continue
-        return results
+                data = self.list_revenue_history(str(start), str(end), token=token)
+            except CoupangClientUnavailable as exc:
+                errors.append(f"매출인식 조회 실패: {exc}")
+                break
+            rows = data.get("data") or []
+            all_rows.extend(rows)
+            token = data.get("nextToken") or ""
+            if not rows or not token:
+                break
+        return all_rows, errors
 
     # ── 연결 진단 ─────────────────────────────────────────────
     def diagnose(self) -> dict:
