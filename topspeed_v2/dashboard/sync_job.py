@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dashboard.calc import calc_daily_metric, detect_ad_issue
 from dashboard.coupang_client import CoupangClient, CoupangClientUnavailable
 from dashboard.coupang_ads_client import CoupangAdsClient, CoupangAdsUnavailable
-from shared.db import init_db, upsert_daily_metric, upsert_inventory, add_alert, get_setting
+from shared.db import init_db, get_conn, upsert_daily_metric, upsert_inventory, add_alert, get_setting
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -161,19 +161,27 @@ def run_sync(
 
     low_stock_floor = int(get_setting("low_stock_floor", "5"))
     for item in inventory_items:
+        sku = item["vendorItemId"]
+        # 쿠팡 동기화는 coupang_qty만 알고 있다 — office_qty는 2창고 기능(입고/이관/출고)이
+        # 별도로 관리하는 값이라, 여기서 0으로 덮어쓰면 그 기록이 매 동기화마다 사라진다.
+        # 기존 office_qty를 읽어와서 그대로 유지한다.
+        with get_conn() as _c:
+            existing = _c.execute("SELECT office_qty FROM inventory WHERE sku = ?", (sku,)).fetchone()
+        existing_office_qty = existing["office_qty"] if existing else 0
+
         upsert_inventory(
-            sku=item["vendorItemId"],
+            sku=sku,
             product_name=item.get("sellerProductName", ""),
             coupang_qty=item.get("quantity", 0),
-            office_qty=0,
+            office_qty=existing_office_qty,
             updated_at=datetime.now(KST).isoformat(),
         )
         if item.get("quantity", 0) <= low_stock_floor:
             add_alert(
                 kind="low_stock",
-                message=f"🔴 {item.get('sellerProductName')} 재고 {item.get('quantity')}개 — 발주 필요",
+                message=f"🔴 {item.get('sellerProductName') or sku} 재고 {item.get('quantity')}개 — 발주 필요",
                 created_at=datetime.now(KST).isoformat(),
-                sku=item["vendorItemId"],
+                sku=sku,
             )
 
     log.append(f"✅ {target_date} 동기화 완료 — SKU {len(all_skus)}개 처리")

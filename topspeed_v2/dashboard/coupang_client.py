@@ -251,21 +251,42 @@ class CoupangClient:
 
     # ── 로켓그로스 재고 ───────────────────────────────────────
     def list_rocket_growth_inventory(self) -> list[dict]:
-        """로켓그로스 창고 재고 수집"""
-        data = self.list_products(max_per_page=100, rocket_growth=True)
-        products = data.get("data") or []
-        result = []
-        for product in products:
-            for item in product.get("items", [product]):
-                vid = str(item.get("vendorItemId") or item.get("sellerProductItemId") or "")
-                qty = item.get("stockQuantity") or item.get("quantity") or 0
+        """
+        로켓그로스 창고 재고 + 최근 30일 판매량 수집.
+
+        예전엔 일반 상품 목록 API(businessTypes=rocketGrowth)를 억지로 썼는데,
+        그 응답엔애초에 "items" 배열이 없어서(product.get("items", [product])가
+        product 자신을 가짜 item으로 써버림) vendorItemId·수량이 전부 빈 값/0으로
+        나왔다 — 그 결과 upsert_inventory()가 매번 sku=''로 덮어써져서
+        inventory 테이블에 133개가 아니라 실제로는 딱 1줄만 남아있었다
+        (2026-07-25 실제 DB에서 확인됨).
+
+        로켓그로스 전용 API(rg_open_api)를 직접 써야 vendorItemId·재고량·
+        salesCountMap(최근 30일 판매량)이 제대로 나온다.
+        """
+        path = f"/v2/providers/rg_open_api/apis/api/v1/vendors/{self.vendor_id}/rg/inventory/summaries"
+        result: list[dict] = []
+        next_token = None
+        for _ in range(200):
+            params = {"nextToken": next_token} if next_token else {}
+            data = self._get(path, params)
+            rows = data.get("data") or []
+            for row in rows:
+                vid = str(row.get("vendorItemId") or "")
+                if not vid:
+                    continue
+                inv = row.get("inventoryDetails") or {}
+                sales = row.get("salesCountMap") or {}
                 result.append({
                     "vendorItemId": vid,
-                    "itemName": item.get("itemName", ""),
-                    "sellerProductName": product.get("sellerProductName", ""),
-                    "quantity": int(qty),
+                    "quantity": int(inv.get("totalOrderableQuantity") or 0),
+                    "sales_last_30d": int(sales.get("SALES_COUNT_LAST_THIRTY_DAYS") or 0),
+                    "externalSkuId": row.get("externalSkuId"),
                     "type": "rocket",
                 })
+            next_token = data.get("nextToken")
+            if not rows or not next_token:
+                break
         return result
 
     # ── 정산 ──────────────────────────────────────────────────
