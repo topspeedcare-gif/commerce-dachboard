@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import time
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
@@ -50,26 +51,39 @@ class CoupangClient:
         )
         return {"Authorization": auth, "Content-Type": "application/json;charset=UTF-8"}
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
+    def _get(self, path: str, params: dict | None = None, retries: int = 3) -> dict:
+        """
+        429(Too Many Requests)는 쿠팡이 짧은 시간에 요청을 너무 많이 보냈을 때
+        내려주는 응답이다 — 특히 get_rocket_growth_product_info()처럼 상품
+        수십~수백 개를 순차 조회할 때 실제로 발생하는 걸 확인했다(2026-07-25).
+        즉시 실패시키는 대신 지수 백오프로 몇 번 재시도한다.
+        """
         query = urlencode(params or {})
         url = BASE_URL + path + ("?" + query if query else "")
-        req = Request(url, headers=self._headers("GET", path, query), method="GET")
-        try:
-            with urlopen(req, timeout=20) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            # 쿠팡이 응답 본문에 실제 사유를 담아 보내는 경우가 많음 (예: 잘못된 status 값,
-            # 조회 기간 초과 등) — 예전엔 이 본문을 버리고 "400 Bad Request"만 보여줘서
-            # 정확히 뭐가 문제인지 알 수 없었음. 이제 본문까지 그대로 보여준다.
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            req = Request(url, headers=self._headers("GET", path, query), method="GET")
             try:
-                body = exc.read().decode("utf-8")[:300]
-            except Exception:
-                body = ""
-            raise CoupangClientUnavailable(
-                f"쿠팡 API 호출 실패: HTTP {exc.code} {exc.reason} — {body}"
-            ) from exc
-        except Exception as exc:
-            raise CoupangClientUnavailable(f"쿠팡 API 호출 실패: {exc}") from exc
+                with urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < retries:
+                    time.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
+                    last_exc = exc
+                    continue
+                # 쿠팡이 응답 본문에 실제 사유를 담아 보내는 경우가 많음 (예: 잘못된 status 값,
+                # 조회 기간 초과 등) — 예전엔 이 본문을 버리고 "400 Bad Request"만 보여줘서
+                # 정확히 뭐가 문제인지 알 수 없었음. 이제 본문까지 그대로 보여준다.
+                try:
+                    body = exc.read().decode("utf-8")[:300]
+                except Exception:
+                    body = ""
+                raise CoupangClientUnavailable(
+                    f"쿠팡 API 호출 실패: HTTP {exc.code} {exc.reason} — {body}"
+                ) from exc
+            except Exception as exc:
+                raise CoupangClientUnavailable(f"쿠팡 API 호출 실패: {exc}") from exc
+        raise CoupangClientUnavailable(f"쿠팡 API 호출 실패: {last_exc}")
 
     # ── 날짜 헬퍼 ─────────────────────────────────────────────
     @staticmethod
@@ -108,6 +122,50 @@ class CoupangClient:
             if not items or not next_token:
                 break
         return results
+
+    def get_product_detail(self, seller_product_id: str | int) -> dict:
+        """
+        상품 상세 조회 — list_products()의 목록 응답엔 "items"(옵션별 정보)가
+        아예 없어서, 옵션별 vendorItemId·가격을 얻으려면 이 상세 API를 따로 호출해야 한다.
+        """
+        path = f"/v2/providers/seller_api/apis/api/v1/marketplace/seller-products/{seller_product_id}"
+        return self._get(path)
+
+    def get_rocket_growth_product_info(self) -> dict[str, dict]:
+        """
+        전체 상품을 순회하며 로켓그로스 옵션(rocketGrowthItemData)의
+        vendorItemId -> {name, price} 매핑을 만든다.
+
+        상품 상세의 items[].rocketGrowthItemData.vendorItemId는
+        rg_open_api(list_rocket_growth_inventory)가 돌려주는 vendorItemId와
+        같은 값이다 — 같은 옵션이라도 판매자배송용과 로켓그로스용은
+        vendorItemId가 서로 다르므로, marketplaceItemData가 아니라
+        반드시 rocketGrowthItemData 쪽을 써야 한다.
+        """
+        info: dict[str, dict] = {}
+        for product in self.list_all_products():
+            sp_id = product.get("sellerProductId")
+            if not sp_id:
+                continue
+            try:
+                detail = self.get_product_detail(sp_id)
+            except CoupangClientUnavailable:
+                continue
+            data = detail.get("data") or {}
+            product_name = data.get("sellerProductName") or data.get("displayProductName") or ""
+            for item in data.get("items") or []:
+                rg = item.get("rocketGrowthItemData") or {}
+                vid = rg.get("vendorItemId")
+                if not vid:
+                    continue
+                price_data = rg.get("priceData") or {}
+                item_name = item.get("itemName") or ""
+                full_name = f"{product_name} {item_name}".strip()
+                info[str(vid)] = {
+                    "name": full_name or product_name,
+                    "price": int(price_data.get("salePrice") or 0),
+                }
+        return info
 
     # ── 주문·매출 ─────────────────────────────────────────────
     def list_orders(

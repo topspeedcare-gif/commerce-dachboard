@@ -32,11 +32,13 @@ CREATE TABLE IF NOT EXISTS daily_metrics (
 );
 
 CREATE TABLE IF NOT EXISTS inventory (
-    sku             TEXT PRIMARY KEY,
-    product_name    TEXT,
-    coupang_qty     INTEGER DEFAULT 0,
-    office_qty      INTEGER DEFAULT 0,
-    updated_at      TEXT
+    sku                 TEXT PRIMARY KEY,
+    product_name        TEXT,
+    coupang_qty         INTEGER DEFAULT 0,
+    office_qty          INTEGER DEFAULT 0,
+    updated_at          TEXT,
+    sales_velocity_30d  REAL DEFAULT 0,
+    unit_price          INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS alerts (
@@ -91,6 +93,19 @@ def get_conn():
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    SCHEMA의 CREATE TABLE IF NOT EXISTS는 이미 존재하는 테이블에 새 컬럼을
+    추가해주지 않는다 — 여기서 없는 컬럼만 골라 ALTER TABLE로 보강한다.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(inventory)").fetchall()}
+    if "sales_velocity_30d" not in cols:
+        conn.execute("ALTER TABLE inventory ADD COLUMN sales_velocity_30d REAL DEFAULT 0")
+    if "unit_price" not in cols:
+        conn.execute("ALTER TABLE inventory ADD COLUMN unit_price INTEGER DEFAULT 0")
 
 
 def upsert_daily_metric(row: dict) -> None:
@@ -105,17 +120,35 @@ def upsert_daily_metric(row: dict) -> None:
         conn.execute(sql, row)
 
 
-def upsert_inventory(sku: str, product_name: str, coupang_qty: int, office_qty: int, updated_at: str) -> None:
+def upsert_inventory(
+    sku: str,
+    product_name: str,
+    coupang_qty: int,
+    office_qty: int,
+    updated_at: str,
+    sales_velocity_30d: float | None = None,
+    unit_price: int | None = None,
+) -> None:
+    """
+    sales_velocity_30d/unit_price를 안 주면(None) 기존 값을 그대로 유지한다 —
+    예를 들어 대시보드의 "재고 수동 조정" 폼은 이 값들을 모르므로, 안 건드리고
+    싶을 때 그냥 생략하면 된다.
+    """
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO inventory (sku, product_name, coupang_qty, office_qty, updated_at)
-            VALUES (:sku, :product_name, :coupang_qty, :office_qty, :updated_at)
+            INSERT INTO inventory
+                (sku, product_name, coupang_qty, office_qty, updated_at, sales_velocity_30d, unit_price)
+            VALUES
+                (:sku, :product_name, :coupang_qty, :office_qty, :updated_at,
+                 COALESCE(:sales_velocity_30d, 0), COALESCE(:unit_price, 0))
             ON CONFLICT(sku) DO UPDATE SET
                 product_name=excluded.product_name,
                 coupang_qty=excluded.coupang_qty,
                 office_qty=excluded.office_qty,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                sales_velocity_30d=COALESCE(:sales_velocity_30d, inventory.sales_velocity_30d),
+                unit_price=COALESCE(:unit_price, inventory.unit_price)
             """,
             {
                 "sku": sku,
@@ -123,6 +156,8 @@ def upsert_inventory(sku: str, product_name: str, coupang_qty: int, office_qty: 
                 "coupang_qty": coupang_qty,
                 "office_qty": office_qty,
                 "updated_at": updated_at,
+                "sales_velocity_30d": sales_velocity_30d,
+                "unit_price": unit_price,
             },
         )
 
@@ -329,10 +364,17 @@ REORDER_SAFETY_DAYS_DEFAULT = 7
 
 def get_stock_predictions(velocity_days: int = 14) -> list[dict]:
     """
-    SKU별 최근 velocity_days일 평균 판매량(일일 판매속도)과 현재 재고
-    (쿠팡+사무실 합계)로 예상 품절일수(stock_days)를 계산한다.
-    판매 이력이 없는 SKU는 stock_days=None (예측 불가 — 무한대로 취급하지 않고
-    "판단할 데이터가 없다"는 뜻으로 명확히 구분한다).
+    SKU별 일일 판매속도와 현재 재고(쿠팡+사무실 합계)로 예상 품절일수(stock_days)를
+    계산한다. 판매 이력이 없는 SKU는 stock_days=None (예측 불가 — 무한대로
+    취급하지 않고 "판단할 데이터가 없다"는 뜻으로 명확히 구분한다).
+
+    판매속도 우선순위:
+      1) inventory.sales_velocity_30d — 로켓그로스 전용 API(salesCountMap)에서
+         나온 실제 30일 판매량/30. 로켓그로스 상품은 주문서(ordersheets) API에
+         거의 안 잡혀서 daily_metrics만으로는 판매속도를 알 수 없기 때문에,
+         이 값이 있으면(>0) 이걸 우선 쓴다.
+      2) 없으면(0) daily_metrics에서 최근 velocity_days일 평균 판매량 —
+         판매자배송 SKU는 이 경로로 계산된다.
 
     반환: stock_days가 가장 임박한(작은) 순으로 정렬된 리스트.
     각 항목: sku, product_name, total_qty, daily_velocity, stock_days
@@ -344,16 +386,17 @@ def get_stock_predictions(velocity_days: int = 14) -> list[dict]:
             (f"-{int(velocity_days)} days",),
         ).fetchall()
         inventory_rows = conn.execute(
-            "SELECT sku, product_name, coupang_qty, office_qty FROM inventory"
+            "SELECT sku, product_name, coupang_qty, office_qty, sales_velocity_30d FROM inventory"
         ).fetchall()
 
-    velocity_by_sku = {r["sku"]: (r["daily_velocity"] or 0.0) for r in velocity_rows}
+    order_velocity_by_sku = {r["sku"]: (r["daily_velocity"] or 0.0) for r in velocity_rows}
 
     results = []
     for inv in inventory_rows:
         sku = inv["sku"]
         total_qty = inv["coupang_qty"] + inv["office_qty"]
-        velocity = velocity_by_sku.get(sku, 0.0)
+        rocket_velocity = inv["sales_velocity_30d"] or 0.0
+        velocity = rocket_velocity if rocket_velocity > 0 else order_velocity_by_sku.get(sku, 0.0)
         stock_days = round(total_qty / velocity, 1) if velocity > 0 else None
         results.append({
             "sku": sku,

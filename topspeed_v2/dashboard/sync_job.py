@@ -135,9 +135,15 @@ def run_sync(
 
     # 4. 재고 수집·저장 — 로켓그로스 먼저 시도, 권한 없으면(403 등) 판매자배송으로 폴백
     inventory_items: list[dict] = []
+    rg_product_info: dict[str, dict] = {}
     try:
         inventory_items = client.list_rocket_growth_inventory()
         log.append(f"ℹ️ 로켓그로스 재고 {len(inventory_items)}건 수집")
+        try:
+            rg_product_info = client.get_rocket_growth_product_info()
+            log.append(f"ℹ️ 상품명·판매가 매핑 {len(rg_product_info)}건 수집")
+        except CoupangClientUnavailable as exc:
+            log.append(f"⚠️ 상품명·판매가 매핑 실패 (재고 수치는 그대로 사용): {exc}")
     except CoupangClientUnavailable as exc:
         log.append(f"⚠️ 로켓그로스 재고 수집 실패 ({exc}) — 판매자배송 재고로 재시도합니다")
         try:
@@ -162,6 +168,15 @@ def run_sync(
     low_stock_floor = int(get_setting("low_stock_floor", "5"))
     for item in inventory_items:
         sku = item["vendorItemId"]
+        info = rg_product_info.get(sku, {})
+        product_name = info.get("name") or item.get("sellerProductName", "")
+        # 로켓그로스는 salesCountMap.SALES_COUNT_LAST_THIRTY_DAYS(최근 30일 판매량)를
+        # 30으로 나눈 하루 평균을 판매속도로 쓴다 — ordersheets엔 로켓그로스 판매가
+        # 거의 안 잡혀서, 이게 사실상 유일하게 신뢰할 수 있는 판매속도 소스다.
+        sales_last_30d = item.get("sales_last_30d")
+        velocity = round(sales_last_30d / 30, 3) if sales_last_30d is not None else None
+        unit_price = info.get("price")
+
         # 쿠팡 동기화는 coupang_qty만 알고 있다 — office_qty는 2창고 기능(입고/이관/출고)이
         # 별도로 관리하는 값이라, 여기서 0으로 덮어쓰면 그 기록이 매 동기화마다 사라진다.
         # 기존 office_qty를 읽어와서 그대로 유지한다.
@@ -171,15 +186,17 @@ def run_sync(
 
         upsert_inventory(
             sku=sku,
-            product_name=item.get("sellerProductName", ""),
+            product_name=product_name,
             coupang_qty=item.get("quantity", 0),
             office_qty=existing_office_qty,
             updated_at=datetime.now(KST).isoformat(),
+            sales_velocity_30d=velocity,
+            unit_price=unit_price,
         )
         if item.get("quantity", 0) <= low_stock_floor:
             add_alert(
                 kind="low_stock",
-                message=f"🔴 {item.get('sellerProductName') or sku} 재고 {item.get('quantity')}개 — 발주 필요",
+                message=f"🔴 {product_name or sku} 재고 {item.get('quantity')}개 — 발주 필요",
                 created_at=datetime.now(KST).isoformat(),
                 sku=sku,
             )
