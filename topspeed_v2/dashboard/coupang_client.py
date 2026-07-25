@@ -141,15 +141,29 @@ class CoupangClient:
             params["nextToken"] = next_token
         return self._get(path, params)
 
-    def list_orders_range(self, days_back: int = 7) -> tuple[list[dict], list[str]]:
+    def list_orders_range(
+        self, days_back: int = 7, single_date: str | None = None
+    ) -> tuple[list[dict], list[str]]:
         """
-        최근 N일 전체 주문 수집 (완료 포함, 상태별로 50건씩 페이징하며 전부 수집)
+        전체 주문 수집 (완료 포함, 상태별로 50건씩 페이징하며 전부 수집)
+
+        single_date를 주면 그 날짜(yyyy-MM-dd) 하루치만, 안 주면 "오늘 기준"
+        days_back일 전 ~ 오늘까지 수집한다.
+
+        주의: single_date를 안 쓰면 항상 "지금 이 순간" 기준으로 날짜를 계산한다 —
+        예전엔 sync_job.py가 target_date를 결과에 라벨로만 쓰고 실제 조회는 항상
+        이 기본값(오늘 기준 어제)으로 했었음. 그래서 예전 날짜를 다시 동기화하면
+        엉뚱한 날짜의 주문이 잘못된 날짜 라벨로 저장되는 버그가 있었음 —
+        이제 target_date를 그대로 single_date로 넘기면 정확히 그 날짜만 조회된다.
 
         반환: (주문 리스트, 에러 메시지 리스트)
         이전엔 실패를 조용히 넘어가서 "주문 0건"이 진짜 0건인지
         인증 실패인지 구분이 안 됐음 — 이제 에러를 같이 반환한다.
         """
-        start, end = self._date_range(days_back)
+        if single_date:
+            start, end = single_date, single_date
+        else:
+            start, end = self._date_range(days_back)
         all_orders: list[dict] = []
         errors: list[str] = []
         for status in ["ACCEPT", "INSTRUCT", "DEPARTURE", "DELIVERING", "FINAL_DELIVERY"]:

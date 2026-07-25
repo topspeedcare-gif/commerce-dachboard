@@ -69,13 +69,18 @@ def run_sync(
         return f"❌ 쿠팡 오픈API 미연결: {exc}"
 
     # 1. 주문 데이터 수집 → SKU별 집계
-    orders, order_errors = client.list_orders_range(days_back=1)
+    # single_date=target_date로 정확히 그 날짜의 주문만 조회한다 (안 그러면
+    # "지금 기준 어제"만 항상 조회되어, 과거 날짜를 재동기화해도 엉뚱한 날짜의
+    # 주문이 target_date 라벨로 잘못 저장되는 버그가 있었음 — 실제로 발견됨).
+    orders, order_errors = client.list_orders_range(single_date=target_date)
     for err in order_errors:
         log.append(f"⚠️ 주문 {err}")
 
     per_sku_sales: dict[str, dict] = defaultdict(lambda: {"qty": 0, "revenue": 0})
     for order in orders:
-        for item in order.get("items", []):
+        # 쿠팡 API가 실제로 내려주는 필드명은 "orderItems"다 ("items"가 아님) —
+        # 이전엔 여기서 늘 빈 리스트를 읽어서, 주문이 잡혀도 매출이 항상 0으로 집계되고 있었다.
+        for item in order.get("orderItems", []):
             sku = str(item.get("vendorItemId", "unknown"))
             qty = int(item.get("shippingCount", 0) or 0)
             price = int(item.get("orderPrice", 0) or 0)
