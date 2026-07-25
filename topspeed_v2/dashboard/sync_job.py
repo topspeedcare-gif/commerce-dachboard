@@ -166,6 +166,11 @@ def run_sync(
             )
 
     low_stock_floor = int(get_setting("low_stock_floor", "5"))
+    # 로켓그로스는 판매속도가 SKU마다 크게 달라서, 고정 수량 기준(예: 5개 이하)보다
+    # "일 판매량 대비 며칠 치 남았는지"가 훨씬 실질적인 경고 기준이다.
+    # 판매 이력이 없는 신상품은 velocity=0이라 이 계산이 불가능하므로,
+    # 그 경우에만 예전 방식(고정 수량 기준)으로 대체 판단한다.
+    rocket_stock_alert_days = int(get_setting("rocket_stock_alert_days", "7"))
     for item in inventory_items:
         sku = item["vendorItemId"]
         info = rg_product_info.get(sku, {})
@@ -193,10 +198,24 @@ def run_sync(
             sales_velocity_30d=velocity,
             unit_price=unit_price,
         )
-        if item.get("quantity", 0) <= low_stock_floor:
+        qty = item.get("quantity", 0)
+        if velocity and velocity > 0:
+            stock_days = round(qty / velocity, 1)
+            if stock_days <= rocket_stock_alert_days:
+                add_alert(
+                    kind="rocket_low_stock",
+                    message=(
+                        f"🚀 {product_name or sku} 재고 {qty}개 — 약 {stock_days}일 후 품절 예상 "
+                        f"(일 평균 {velocity:.1f}개 판매) — 발주 필요"
+                    ),
+                    created_at=datetime.now(KST).isoformat(),
+                    sku=sku,
+                )
+        elif qty <= low_stock_floor:
+            # 판매 이력이 없어 판매속도를 모르는 경우에만 예전 방식(고정 수량 기준)으로 판단.
             add_alert(
                 kind="low_stock",
-                message=f"🔴 {product_name or sku} 재고 {item.get('quantity')}개 — 발주 필요",
+                message=f"🔴 {product_name or sku} 재고 {qty}개 — 발주 필요 (판매 이력 없음)",
                 created_at=datetime.now(KST).isoformat(),
                 sku=sku,
             )

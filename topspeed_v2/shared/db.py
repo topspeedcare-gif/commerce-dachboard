@@ -360,6 +360,42 @@ def get_inventory_moves(sku: str | None = None, limit: int = 20) -> list[sqlite3
 
 REORDER_LEAD_TIME_DAYS_DEFAULT = 14
 REORDER_SAFETY_DAYS_DEFAULT = 7
+ROCKET_STOCK_ALERT_DAYS_DEFAULT = 7
+
+
+def get_rocket_growth_low_stock(days_threshold: int | None = None) -> list[dict]:
+    """
+    로켓그로스 재고(coupang_qty)만을 기준으로, 판매속도(sales_velocity_30d) 대비
+    예상 품절일수가 days_threshold 이하인 SKU를 뽑는다 — 사무실 재고(office_qty)는
+    별개로 관리되는 값이라 여기 포함하지 않는다.
+
+    days_threshold를 안 주면 settings의 'rocket_stock_alert_days'(기본 7일) 사용.
+    판매 이력이 없는(velocity=0) SKU는 품절일수를 계산할 수 없으므로 제외한다 —
+    그런 SKU는 sync_job.py가 고정 수량 기준으로 별도 처리한다.
+    """
+    if days_threshold is None:
+        days_threshold = int(get_setting("rocket_stock_alert_days", str(ROCKET_STOCK_ALERT_DAYS_DEFAULT)))
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT sku, product_name, coupang_qty, sales_velocity_30d FROM inventory "
+            "WHERE sales_velocity_30d > 0"
+        ).fetchall()
+
+    results = []
+    for r in rows:
+        stock_days = round(r["coupang_qty"] / r["sales_velocity_30d"], 1)
+        if stock_days <= days_threshold:
+            results.append({
+                "sku": r["sku"],
+                "product_name": r["product_name"],
+                "coupang_qty": r["coupang_qty"],
+                "daily_velocity": round(r["sales_velocity_30d"], 2),
+                "stock_days": stock_days,
+            })
+
+    results.sort(key=lambda x: x["stock_days"])
+    return results
 
 
 def get_stock_predictions(velocity_days: int = 14) -> list[dict]:

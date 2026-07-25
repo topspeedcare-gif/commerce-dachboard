@@ -31,6 +31,7 @@ from shared.db import (
     get_setting,
     LOW_OFFICE_STOCK_FLOOR_DEFAULT,
     get_rocket_growth_revenue_estimate,
+    get_rocket_growth_low_stock,
 )
 
 TOKEN_URL = "https://kauth.kakao.com/oauth/token"
@@ -150,6 +151,21 @@ def build_daily_summary(target_date: str | None = None) -> str:
             f"(최근 30일 판매속도 x 판매가 기준 추정치, 정확한 당일 매출 아님)"
         )
         lines.append(f"  · 추정 일평균 판매량: 약 {rg_estimate['total_estimated_daily_qty']}개")
+
+    # 로켓그로스 재고부족은 사무실 재고부족보다 먼저 보여준다 — 주력 판매 채널이라
+    # 우선순위가 더 높고, 판매속도 대비 예상 품절일수라 더 실질적인 경고이기도 하다.
+    rocket_low_stock = get_rocket_growth_low_stock()
+    if rocket_low_stock:
+        lines.append("")
+        lines.append(f"🚀 로켓그로스 재고 부족 {len(rocket_low_stock)}건 (품절 임박순)")
+        for r in rocket_low_stock[:5]:
+            name = r["product_name"] or r["sku"]
+            lines.append(
+                f"  · {name}: {r['coupang_qty']}개 (약 {r['stock_days']}일 후 품절, "
+                f"일 평균 {r['daily_velocity']}개 판매)"
+            )
+        if len(rocket_low_stock) > 5:
+            lines.append(f"  · 외 {len(rocket_low_stock) - 5}건 (슬랙 `발주 제안`으로 전체 확인)")
 
     due_experiments = get_due_experiments()
     if due_experiments:
