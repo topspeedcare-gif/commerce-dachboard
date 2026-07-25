@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from assistant.dispatcher import command
-from shared.db import get_conn, get_setting, LOW_OFFICE_STOCK_FLOOR_DEFAULT
+from shared.db import get_conn, get_setting, LOW_OFFICE_STOCK_FLOOR_DEFAULT, get_reorder_suggestions
 
 
 @command("재고 확인", "재고 현황", "재고")
@@ -59,5 +59,32 @@ def handle_low_office_stock(ctx: dict) -> str:
     for r in rows:
         name = r["product_name"] or r["sku"]
         lines.append(f"  · {name}: 사무실 재고 {r['office_qty']}개")
+
+    return "\n".join(lines)
+
+
+@command("발주 제안", "품절 예측", "발주 필요")
+def handle_reorder_suggestions(ctx: dict) -> str:
+    """
+    최근 판매속도 기준으로 예상 품절일수가 (발주 리드타임 + 안전재고 7일) 이내인
+    SKU에 대해 발주 제안 수량을 보여준다. shared/db.py의 get_reorder_suggestions()가
+    dashboard/web_app.py의 발주 제안 표와 완전히 같은 계산 로직을 쓴다.
+    """
+    suggestions = get_reorder_suggestions()
+
+    if not suggestions:
+        return "✅ 지금 발주가 필요한 SKU가 없습니다."
+
+    first = suggestions[0]
+    lines = [
+        f"🚨 발주 제안 {len(suggestions)}건 "
+        f"(리드타임 {first['lead_time_days']}일 + 안전재고 {first['safety_days']}일 기준)"
+    ]
+    for s in suggestions:
+        name = s["product_name"] or s["sku"]
+        lines.append(
+            f"  · {name}: 재고 {s['total_qty']}개 · 일 평균 {s['daily_velocity']}개 판매 "
+            f"· 예상 품절 {s['stock_days']}일 후 → {s['suggested_order_qty']}개 발주 제안"
+        )
 
     return "\n".join(lines)
