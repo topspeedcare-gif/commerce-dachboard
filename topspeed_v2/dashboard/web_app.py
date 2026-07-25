@@ -30,6 +30,9 @@ from shared.db import (
     add_inventory_move,
     get_inventory_moves,
     InsufficientStockError,
+    get_stock_predictions,
+    get_reorder_suggestions,
+    REORDER_LEAD_TIME_DAYS_DEFAULT,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
@@ -265,6 +268,30 @@ with tab_inv:
     else:
         st.dataframe([dict(m) for m in moves], use_container_width=True)
 
+    st.divider()
+    lead_time = int(get_setting("reorder_lead_time_days", str(REORDER_LEAD_TIME_DAYS_DEFAULT)))
+    st.subheader("📉 품절 예측")
+    st.caption("최근 14일 평균 판매속도 기준 예상 품절일수 (판매 이력 없는 SKU는 예측 불가로 표시)")
+    predictions = [p for p in get_stock_predictions() if p["daily_velocity"] > 0 or p["total_qty"] > 0]
+    if not predictions:
+        st.write("재고 데이터가 없습니다.")
+    else:
+        st.dataframe(
+            [
+                {**p, "stock_days": p["stock_days"] if p["stock_days"] is not None else "예측 불가"}
+                for p in predictions
+            ],
+            use_container_width=True,
+        )
+
+    st.subheader("🚨 발주 제안")
+    st.caption(f"예상 품절일수가 (발주 리드타임 {lead_time}일 + 안전재고 7일) 이내인 SKU만 표시됩니다. 리드타임은 ⚙️ 설정 탭에서 바꿀 수 있어요.")
+    suggestions = get_reorder_suggestions()
+    if not suggestions:
+        st.write("지금 발주가 필요한 SKU가 없습니다.")
+    else:
+        st.dataframe(suggestions, use_container_width=True)
+
 
 # 4) 실험 관리 — 신상품/광고 테스트 가설 등록·판정
 with tab_exp:
@@ -413,9 +440,21 @@ with tab_settings:
         min_value=0, step=1,
         value=int(get_setting("low_stock_floor", "5")),
     )
+    office_stock_floor = st.number_input(
+        "사무실 재고 부족 기준 (이 수량 이하면 입고 필요 알람)",
+        min_value=0, step=1,
+        value=int(get_setting("low_office_stock_floor", "10")),
+    )
+    reorder_lead_time = st.number_input(
+        "발주 리드타임 (일) — 발주해서 재고가 도착하기까지 걸리는 기간",
+        min_value=1, step=1,
+        value=int(get_setting("reorder_lead_time_days", str(REORDER_LEAD_TIME_DAYS_DEFAULT))),
+    )
     if st.button("임계치 저장"):
         set_setting("roas_floor", str(roas_floor))
         set_setting("low_stock_floor", str(low_stock_floor))
+        set_setting("low_office_stock_floor", str(office_stock_floor))
+        set_setting("reorder_lead_time_days", str(reorder_lead_time))
         st.success("임계치가 저장되었습니다. 다음 sync_job.py 실행부터 적용됩니다.")
 
     st.divider()
@@ -426,4 +465,6 @@ with tab_settings:
             _c.execute("DELETE FROM daily_metrics")
             _c.execute("DELETE FROM inventory")
             _c.execute("DELETE FROM alerts")
+            _c.execute("DELETE FROM inventory_moves")
+            _c.execute("DELETE FROM experiments")
         st.success("초기화 완료. 대시보드 탭에서 새로고침 해보세요.")
