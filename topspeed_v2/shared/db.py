@@ -92,6 +92,15 @@ CREATE TABLE IF NOT EXISTS settlements (
     synced_at           TEXT NOT NULL,
     PRIMARY KEY (order_id, sku)
 );
+
+CREATE TABLE IF NOT EXISTS channel_inventory (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_name            TEXT NOT NULL,
+    wing_qty                INTEGER,
+    rocket_qty              INTEGER,
+    rocket_sales_last_30d   INTEGER,
+    synced_at               TEXT NOT NULL
+);
 """
 
 
@@ -388,6 +397,11 @@ def get_rocket_growth_low_stock(days_threshold: int | None = None) -> list[dict]
     days_threshold를 안 주면 settings의 'rocket_stock_alert_days'(기본 7일) 사용.
     판매 이력이 없는(velocity=0) SKU는 품절일수를 계산할 수 없으므로 제외한다 —
     그런 SKU는 sync_job.py가 고정 수량 기준으로 별도 처리한다.
+
+    product_name이 없는 SKU도 제외한다 — 상품 상세 조회로 이름이 안 붙었다는
+    건 현재 판매 중인 상품 목록에서 빠졌다는 뜻이라(판매중단), 실측 결과
+    재고 0·판매속도 0에 가까운 죽은 재고가 대부분이었다. 이런 것들이 "품절
+    임박" 알람 맨 위를 채워서 진짜 신경 써야 할 상품이 묻히는 문제가 있었다.
     """
     if days_threshold is None:
         days_threshold = int(get_setting("rocket_stock_alert_days", str(ROCKET_STOCK_ALERT_DAYS_DEFAULT)))
@@ -395,7 +409,7 @@ def get_rocket_growth_low_stock(days_threshold: int | None = None) -> list[dict]
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT sku, product_name, coupang_qty, sales_velocity_30d FROM inventory "
-            "WHERE sales_velocity_30d > 0"
+            "WHERE sales_velocity_30d > 0 AND product_name IS NOT NULL AND product_name != ''"
         ).fetchall()
 
     results = []
@@ -655,6 +669,43 @@ def get_settlement_vs_expected(date_from: str, date_to: str) -> list[dict]:
         })
     results.sort(key=lambda r: r["date"], reverse=True)
     return results
+
+
+def save_channel_inventory(rows: list[dict], synced_at: str) -> int:
+    """
+    coupang_client.get_full_inventory_report()가 돌려주는 상품별
+    (윙 재고, 로켓그로스 재고) 리스트를 통째로 저장한다. 안정적인 자연키가
+    없어서(같은 상품명이라도 옵션마다 새 행) 매번 전체를 지우고 새로
+    채우는 "최신 스냅샷" 방식으로 저장한다.
+    """
+    with get_conn() as conn:
+        conn.execute("DELETE FROM channel_inventory")
+        for r in rows:
+            conn.execute(
+                """
+                INSERT INTO channel_inventory
+                    (product_name, wing_qty, rocket_qty, rocket_sales_last_30d, synced_at)
+                VALUES (:product_name, :wing_qty, :rocket_qty, :rocket_sales_last_30d, :synced_at)
+                """,
+                {
+                    "product_name": r.get("product_name", ""),
+                    "wing_qty": r.get("wing_qty"),
+                    "rocket_qty": r.get("rocket_qty"),
+                    "rocket_sales_last_30d": r.get("rocket_sales_last_30d"),
+                    "synced_at": synced_at,
+                },
+            )
+    return len(rows)
+
+
+def get_channel_inventory() -> list[dict]:
+    """가장 최근에 저장된 (윙 재고, 로켓그로스 재고) 스냅샷을 상품명 순으로 반환."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT product_name, wing_qty, rocket_qty, rocket_sales_last_30d, synced_at "
+            "FROM channel_inventory ORDER BY product_name"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 if __name__ == "__main__":

@@ -36,10 +36,12 @@ from shared.db import (
     get_rocket_growth_revenue_estimate,
     ROCKET_STOCK_ALERT_DAYS_DEFAULT,
     get_settlement_vs_expected,
+    get_channel_inventory,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync
 from dashboard.settlement_sync import run_settlement_sync
+from dashboard.channel_inventory_sync import run_channel_inventory_sync
 from dashboard.coupang_client import CoupangClient, CoupangClientUnavailable
 
 st.set_page_config(page_title="TOPSPEED 대시보드", layout="wide")
@@ -297,6 +299,25 @@ with tab_inv:
                 st.rerun()
             except InsufficientStockError as exc:
                 st.error(f"❌ {exc}")
+
+    st.divider()
+    st.subheader("📦 통합 재고 현황 (윙 x 로켓그로스)")
+    st.caption(
+        "상품명 기준으로 윙(판매자배송) 재고와 로켓그로스 재고를 나란히 보여줍니다. "
+        "옵션마다 API 조회가 따로 필요해서(상품 약 60개 기준 40초 안팎) 자동 동기화엔 안 들어있고, "
+        "아래 버튼으로 필요할 때 갱신합니다."
+    )
+    if st.button("🔄 통합 재고 동기화 (약 40초 소요)"):
+        with st.spinner("윙 + 로켓그로스 재고를 상품별로 조회하는 중... (40초 안팎)"):
+            st.code(run_channel_inventory_sync())
+        st.rerun()
+
+    channel_rows = get_channel_inventory()
+    if not channel_rows:
+        st.write("데이터가 없습니다. 위 버튼으로 먼저 동기화하세요.")
+    else:
+        st.caption(f"최근 동기화: {channel_rows[0]['synced_at'][:16]}")
+        st.dataframe(channel_rows, use_container_width=True)
 
     st.divider()
     st.subheader("최근 재고 이동 이력 (최근 20건)")

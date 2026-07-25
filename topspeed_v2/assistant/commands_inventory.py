@@ -11,7 +11,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from assistant.dispatcher import command
-from shared.db import get_conn, get_setting, LOW_OFFICE_STOCK_FLOOR_DEFAULT, get_reorder_suggestions
+from shared.db import (
+    get_conn,
+    get_setting,
+    LOW_OFFICE_STOCK_FLOOR_DEFAULT,
+    get_reorder_suggestions,
+    get_channel_inventory,
+)
 
 
 @command("재고 확인", "재고 현황", "재고")
@@ -86,5 +92,28 @@ def handle_reorder_suggestions(ctx: dict) -> str:
             f"  · {name}: 재고 {s['total_qty']}개 · 일 평균 {s['daily_velocity']}개 판매 "
             f"· 예상 품절 {s['stock_days']}일 후 → {s['suggested_order_qty']}개 발주 제안"
         )
+
+    return "\n".join(lines)
+
+
+@command("통합 재고", "윙 그로스 재고", "재고 비교")
+def handle_channel_inventory(ctx: dict) -> str:
+    """
+    상품명 기준으로 윙(판매자배송) 재고와 로켓그로스 재고를 나란히 보여준다.
+    대시보드 "통합 재고 동기화" 버튼(또는 python dashboard/channel_inventory_sync.py)을
+    먼저 실행해야 데이터가 쌓인다 — 상품 옵션마다 API를 개별 조회해야 해서
+    실행에 시간이 좀 걸려(약 40초) 자동 동기화엔 안 들어있다.
+    """
+    rows = get_channel_inventory()
+    if not rows:
+        return "📭 통합 재고 데이터가 없습니다. 대시보드에서 '통합 재고 동기화'를 먼저 실행하세요."
+
+    lines = [f"📦 통합 재고 현황 (윙 x 로켓그로스, {len(rows)}개 상품)"]
+    for r in rows[:15]:
+        wing = r["wing_qty"] if r["wing_qty"] is not None else "-"
+        rocket = r["rocket_qty"] if r["rocket_qty"] is not None else "-"
+        lines.append(f"  · {r['product_name']}: 윙 {wing} / 그로스 {rocket}")
+    if len(rows) > 15:
+        lines.append(f"  · 외 {len(rows) - 15}건 (대시보드에서 전체 확인)")
 
     return "\n".join(lines)

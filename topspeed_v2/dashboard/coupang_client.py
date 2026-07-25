@@ -167,6 +167,66 @@ class CoupangClient:
                 }
         return info
 
+    def get_full_inventory_report(self) -> list[dict]:
+        """
+        상품명 기준으로 윙(판매자배송) 재고와 로켓그로스 재고를 나란히 보여주는
+        통합 리포트. 옵션 하나(같은 item)라도 판매자배송용 vendorItemId와
+        로켓그로스용 vendorItemId가 서로 다르므로, 상품 상세 하나에서 둘 다
+        꺼내 짝을 맞춘다.
+
+        윙 재고는 get_vendor_item_inventory()로 옵션마다 개별 조회해야 해서
+        상품 수가 많으면 API 호출이 꽤 많아진다(상품 상세 조회 + 옵션별 윙 재고
+        조회) — 그래서 list_rocket_growth_inventory()처럼 자주 도는 일일
+        동기화에는 안 넣고, 필요할 때 따로 부르는 함수로 뺐다.
+
+        윙에도 로켓그로스에도 없는 옵션(비활성/판매중지)은 결과에서 제외한다.
+        """
+        rocket_inventory = {it["vendorItemId"]: it for it in self.list_rocket_growth_inventory()}
+
+        report: list[dict] = []
+        for product in self.list_all_products():
+            sp_id = product.get("sellerProductId")
+            if not sp_id:
+                continue
+            try:
+                detail = self.get_product_detail(sp_id)
+            except CoupangClientUnavailable:
+                continue
+            data = detail.get("data") or {}
+            product_name = data.get("sellerProductName") or data.get("displayProductName") or ""
+
+            for item in data.get("items") or []:
+                item_name = item.get("itemName") or ""
+                full_name = f"{product_name} {item_name}".strip() or product_name
+
+                mp = item.get("marketplaceItemData") or {}
+                rg = item.get("rocketGrowthItemData") or {}
+
+                wing_vid = mp.get("vendorItemId")
+                wing_qty = None
+                if wing_vid:
+                    try:
+                        inv = self.get_vendor_item_inventory(wing_vid)
+                        wing_qty = (inv.get("data") or {}).get("amountInStock")
+                    except CoupangClientUnavailable:
+                        wing_qty = None
+
+                rocket_vid = rg.get("vendorItemId")
+                rocket_row = rocket_inventory.get(str(rocket_vid)) if rocket_vid else None
+                rocket_qty = rocket_row["quantity"] if rocket_row else None
+                rocket_sales_30d = rocket_row["sales_last_30d"] if rocket_row else None
+
+                if wing_vid is None and rocket_vid is None:
+                    continue  # 이 옵션은 윙에도 로켓그로스에도 등록되어 있지 않음
+
+                report.append({
+                    "product_name": full_name,
+                    "wing_qty": wing_qty,
+                    "rocket_qty": rocket_qty,
+                    "rocket_sales_last_30d": rocket_sales_30d,
+                })
+        return report
+
     # ── 주문·매출 ─────────────────────────────────────────────
     def list_orders(
         self,
