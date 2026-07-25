@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv, set_key
 
-from shared.db import get_conn
+from shared.db import get_conn, get_due_experiments, get_setting, LOW_OFFICE_STOCK_FLOOR_DEFAULT
 
 TOKEN_URL = "https://kauth.kakao.com/oauth/token"
 MEMO_URL = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
@@ -112,26 +112,55 @@ def send_kakao_message(text: str) -> dict:
 
 
 def build_daily_summary(target_date: str | None = None) -> str:
-    """shared/db.py의 daily_metrics에서 지정한 날짜(기본 오늘) 실적을 집계해 요약 문자열을 만든다."""
+    """
+    shared/db.py의 daily_metrics에서 지정한 날짜(기본 오늘) 실적을 집계하고,
+    판정 대기 실험·사무실 재고 부족 SKU까지 한 번에 모아 요약 문자열을 만든다.
+    """
     target_date = target_date or str(date.today())
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM daily_metrics WHERE date = ?", (target_date,)).fetchall()
 
+    lines = [f"📊 TOPSPEED 대시보드 요약 ({target_date})"]
+
     if not rows:
-        return f"📊 TOPSPEED 대시보드 요약 ({target_date})\n집계된 데이터가 없습니다."
+        lines.append("집계된 데이터가 없습니다.")
+    else:
+        revenue = sum(r["revenue"] for r in rows)
+        ad_spend = sum(r["ad_spend"] for r in rows)
+        net_profit = sum(r["net_profit"] for r in rows)
+        roas = round(revenue / ad_spend, 2) if ad_spend else 0.0
+        lines += [
+            f"매출: {revenue:,}원",
+            f"광고비: {ad_spend:,}원",
+            f"ROAS: {roas}",
+            f"순이익: {net_profit:,}원",
+        ]
 
-    revenue = sum(r["revenue"] for r in rows)
-    ad_spend = sum(r["ad_spend"] for r in rows)
-    net_profit = sum(r["net_profit"] for r in rows)
-    roas = round(revenue / ad_spend, 2) if ad_spend else 0.0
+    due_experiments = get_due_experiments()
+    if due_experiments:
+        lines.append("")
+        lines.append(f"🧪 판정 대기 실험 {len(due_experiments)}건")
+        for exp in due_experiments[:5]:
+            lines.append(f"  · {exp['sku']}: {exp['hypothesis'][:30]}")
+        if len(due_experiments) > 5:
+            lines.append(f"  · 외 {len(due_experiments) - 5}건 (슬랙 `판정 대기 실험`으로 전체 확인)")
 
-    return (
-        f"📊 TOPSPEED 대시보드 요약 ({target_date})\n"
-        f"매출: {revenue:,}원\n"
-        f"광고비: {ad_spend:,}원\n"
-        f"ROAS: {roas}\n"
-        f"순이익: {net_profit:,}원"
-    )
+    floor = int(get_setting("low_office_stock_floor", str(LOW_OFFICE_STOCK_FLOOR_DEFAULT)))
+    with get_conn() as conn:
+        low_stock_rows = conn.execute(
+            "SELECT sku, product_name, office_qty FROM inventory WHERE office_qty <= ? ORDER BY office_qty ASC",
+            (floor,),
+        ).fetchall()
+    if low_stock_rows:
+        lines.append("")
+        lines.append(f"🔴 사무실 재고 부족 {len(low_stock_rows)}건 (기준 {floor}개 이하)")
+        for r in low_stock_rows[:5]:
+            name = r["product_name"] or r["sku"]
+            lines.append(f"  · {name}: {r['office_qty']}개")
+        if len(low_stock_rows) > 5:
+            lines.append(f"  · 외 {len(low_stock_rows) - 5}건 (슬랙 `입고 필요`로 전체 확인)")
+
+    return "\n".join(lines)
 
 
 def send_daily_summary(target_date: str | None = None) -> dict:
