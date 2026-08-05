@@ -132,6 +132,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "unit_price" not in cols:
         conn.execute("ALTER TABLE inventory ADD COLUMN unit_price INTEGER DEFAULT 0")
 
+    dm_cols = {row["name"] for row in conn.execute("PRAGMA table_info(daily_metrics)").fetchall()}
+    if "channel" not in dm_cols:
+        # 'wing'(판매자배송) | 'rocket'(로켓그로스) | 'unknown' — 매출인식(revenue-history)
+        # 기준으로 채워지며, 주문(ordersheets) API는 로켓그로스가 전혀 안 잡혀서
+        # channel 구분 없이는 두 채널 매출이 뒤섞여 보였다.
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN channel TEXT DEFAULT 'unknown'")
+
 
 def upsert_daily_metric(row: dict) -> None:
     cols = list(row.keys())

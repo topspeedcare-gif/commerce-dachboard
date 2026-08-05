@@ -132,17 +132,24 @@ class CoupangClient:
         return self._get(path)
 
     def get_rocket_growth_product_info(self) -> dict[str, dict]:
-        """
-        전체 상품을 순회하며 로켓그로스 옵션(rocketGrowthItemData)의
-        vendorItemId -> {name, price} 매핑을 만든다.
+        """get_channel_and_product_info()의 rg_product_info만 필요할 때 쓰는 얇은 래퍼.
+        상품 상세를 두 번 순회하지 않도록, 새 코드는 get_channel_and_product_info()를
+        직접 쓰는 걸 권장한다."""
+        _, rg_product_info = self.get_channel_and_product_info()
+        return rg_product_info
 
-        상품 상세의 items[].rocketGrowthItemData.vendorItemId는
-        rg_open_api(list_rocket_growth_inventory)가 돌려주는 vendorItemId와
-        같은 값이다 — 같은 옵션이라도 판매자배송용과 로켓그로스용은
-        vendorItemId가 서로 다르므로, marketplaceItemData가 아니라
-        반드시 rocketGrowthItemData 쪽을 써야 한다.
+    def get_channel_and_product_info(self) -> tuple[dict[str, str], dict[str, dict]]:
+        """상품 상세를 한 번만 순회해서 두 가지를 같이 만든다:
+          1) channel_map: vendorItemId -> 'wing'(판매자배송) | 'rocket'(로켓그로스)
+          2) rg_product_info: 로켓그로스 vendorItemId -> {name, price} (get_rocket_growth_product_info()와 동일한 용도)
+
+        예전엔 이 둘을 각각 별도 함수로 두어 상품 상세를 두 번 순회했다 — 상품이
+        59개면 상세 조회가 118번 호출되어 429(rate limit)에 걸리기 쉬웠고,
+        실제로 그 때문에 일부 vendorItemId가 채널 분류에서 누락되는 걸 확인했다
+        (2026-07-28). 한 번의 순회로 합쳐서 API 호출을 절반으로 줄인다.
         """
-        info: dict[str, dict] = {}
+        channel_map: dict[str, str] = {}
+        rg_product_info: dict[str, dict] = {}
         for product in self.list_all_products():
             sp_id = product.get("sellerProductId")
             if not sp_id:
@@ -154,18 +161,18 @@ class CoupangClient:
             data = detail.get("data") or {}
             product_name = data.get("sellerProductName") or data.get("displayProductName") or ""
             for item in data.get("items") or []:
-                rg = item.get("rocketGrowthItemData") or {}
-                vid = rg.get("vendorItemId")
-                if not vid:
-                    continue
-                price_data = rg.get("priceData") or {}
                 item_name = item.get("itemName") or ""
-                full_name = f"{product_name} {item_name}".strip()
-                info[str(vid)] = {
-                    "name": full_name or product_name,
-                    "price": int(price_data.get("salePrice") or 0),
-                }
-        return info
+                full_name = f"{product_name} {item_name}".strip() or product_name
+                mp = item.get("marketplaceItemData") or {}
+                rg = item.get("rocketGrowthItemData") or {}
+                if mp.get("vendorItemId"):
+                    channel_map[str(mp["vendorItemId"])] = "wing"
+                if rg.get("vendorItemId"):
+                    vid = str(rg["vendorItemId"])
+                    channel_map[vid] = "rocket"
+                    price_data = rg.get("priceData") or {}
+                    rg_product_info[vid] = {"name": full_name, "price": int(price_data.get("salePrice") or 0)}
+        return channel_map, rg_product_info
 
     def get_full_inventory_report(self) -> list[dict]:
         """
@@ -407,14 +414,70 @@ class CoupangClient:
                 break
         return result
 
-    # ── 정산 ──────────────────────────────────────────────────
-    # 예전 list_settlements()는 /v1/settlement-reports/{date} 경로였는데
-    # 실제로 호출해보면 404("No exactly matching API specification")로 한 번도
-    # 성공한 적이 없었다 (2026-07-25 확인). 실제로 동작하는 건 매출인식(revenue-history)
-    # API다 — 대신 recognitionDate(매출이 "확정"되어 조회 가능해지는 날짜)가
-    # 실제 판매일(saleDate)보다 평균 9일 정도 늦게 뜬다는 제약이 있다
-    # (30일치 실측으로 확인됨). "어제 매출" 용도로는 못 쓰고, 정산 검증
-    # (몇 주 전 예상했던 매출이 실제로 얼마나 확정됐는지)에 적합하다.
+    def list_rg_orders_range(self, date_from: str, date_to: str) -> tuple[list[dict], list[str]]:
+        """로켓그로스 주문 조회 — date_from~date_to(YYYY-MM-DD)를 "결제일시(paidAt)"
+        기준으로 전부 모아온다 (페이징 포함, 최대 1개월 제약은 호출하는 쪽에서 지킬 것).
+
+        공식 문서(2026-07-29 확인, developers.coupang.com "로켓그로스 주문 API(목록 쿼리)"):
+        GET /v2/providers/rg_open_api/apis/api/v1/vendors/{vendorId}/rg/orders
+        파라미터: paidDateFrom/paidDateTo (YYYYMMDD, 대시 없이), nextToken(페이징)
+        "결제일시" 기준 — ordersheets의 createdAt과 같은 성격의 즉시성 있는 날짜이고,
+        정산/매출인식(revenue-history)처럼 지연되는 개념이 아니다(실측 확인: 어제자
+        데이터도 바로 조회됨). 응답의 paidAt은 밀리초 단위 유닉스 타임스탬프라
+        KST로 직접 변환해야 한다 — 문서에 별도 안내가 없어 실제 호출로 확인함.
+        최대 조회 기간 1개월, 분당 50회 호출 제한.
+
+        ⚠️ paidDateTo는 실측상 그 날짜 시작 부근(UTC 자정 추정)에서 잘리는 것으로
+        보인다 — paidDateTo=target_date로 조회하면 그날 데이터의 상당수가 빠진다
+        (실측: 7/28 45건 중 12건만 잡힘). 항상 원하는 종료일보다 하루 뒤까지
+        조회한 뒤 paidAt을 KST로 변환해서 원하는 날짜만 다시 걸러낼 것
+        (sync_job.py run_sync()가 이렇게 하고 있음).
+
+        검증: 사용자가 쿠팡 윙 판매자센터에서 직접 확인한 7/28 로켓그로스 주문
+        (42개·1,007,250원)과 이 함수 결과(45개·1,046,250원)를 대조 — 약 7% 오차
+        (취소/반품 가능성, 이 API엔 상태 필드가 없어 완전히 걸러내진 못함)로
+        실사용 가능한 수준임을 확인했다(2026-07-29).
+        """
+        from_dt = datetime.strptime(date_from, "%Y-%m-%d").date()
+        to_dt = datetime.strptime(date_to, "%Y-%m-%d").date()
+        path = f"/v2/providers/rg_open_api/apis/api/v1/vendors/{self.vendor_id}/rg/orders"
+        all_rows: list[dict] = []
+        errors: list[str] = []
+        token = None
+        for _ in range(200):
+            params = {"paidDateFrom": from_dt.strftime("%Y%m%d"), "paidDateTo": to_dt.strftime("%Y%m%d")}
+            if token:
+                params["nextToken"] = token
+            try:
+                data = self._get(path, params)
+            except CoupangClientUnavailable as exc:
+                errors.append(f"로켓그로스 주문 조회 실패: {exc}")
+                break
+            rows = data.get("data") or []
+            all_rows.extend(rows)
+            token = data.get("nextToken")
+            if not rows or not token:
+                break
+        return all_rows, errors
+
+    # ══════════════════════════════════════════════════════════
+    # ⚠️ 정산 (revenue-history) — 판매일 기준 집계에 쓰지 말 것 (2026-07-28 확정)
+    # ══════════════════════════════════════════════════════════
+    # 이 API의 날짜 파라미터(recognitionDate)는 "매출 인식일"(구매확정일 또는
+    # 배송완료 기준일)이지 "판매일"(saleDate)이 아니다 — 완전히 다른 개념이다.
+    # 2026-07-28에 daily_metrics(일별 매출/판매량) 소스를 이 API로 바꿨다가,
+    # 실측 검증 결과 문제가 발견되어 되돌렸다:
+    #   - recognitionDate 7/20~26으로 조회하면 saleDate 7/13~14 판매만 섞여 나옴
+    #     (날짜 자체가 다른 개념이라 "지연"이 아니라 "다른 집합"이었음)
+    #   - 한 달이 지난 날짜(saleDate 6/29)도 쿠팡 셀러 인사이트 리포트 대비
+    #     극히 일부(13,800원/854,250원, 약 1.6%)만 반영되어 있었음 — 지연이 아니라
+    #     이 API 자체가 실제 판매량 대부분을 안 잡는 것으로 보임(원인 미확정)
+    # 예전 list_settlements()(/v1/settlement-reports/{date})는 404로 한 번도 성공한
+    # 적이 없었다(2026-07-25 확인) — 그래서 이 API로 대체했었지만, 위 문제로 인해
+    # **일별 매출/판매량 집계에는 절대 쓰지 말 것.** 정산 대사(내가 예상한 매출과
+    # 실제 정산 확정액을 비교하는 용도, dashboard/settlement_sync.py)에서만 사용한다.
+    # 새 용도로 쓰기 전엔 반드시 공식 문서에서 날짜 필드 의미를 재확인하고 사용자
+    # 승인을 받을 것 (다시 조용히 바꾸지 않기로 함).
     def list_revenue_history(
         self, recognition_date_from: str, recognition_date_to: str, token: str = ""
     ) -> dict:
@@ -431,6 +494,42 @@ class CoupangClient:
             "token": token,
         }
         return self._get(path, params)
+
+    def list_revenue_history_between(self, date_from: str, date_to: str) -> tuple[list[dict], list[str]]:
+        """recognitionDate 기준 date_from~date_to 구간을 1개월 미만 청크로 쪼개
+        전부 모아온다 (페이징 포함). date_to가 오늘/미래면 어제로 당긴다.
+
+        ⚠️ 파일 상단 경고 참고 — daily_metrics(일별 매출/판매량) 집계에는 쓰지 말 것.
+        정산 대사 용도로 넓은 구간을 한 번에 긁어올 때만 쓴다. 현재 sync_job.py는
+        이 함수를 호출하지 않는다(2026-07-28 되돌림) — 삭제하지 않고 남겨둔 상태.
+        """
+        from_dt = datetime.strptime(date_from, "%Y-%m-%d").date()
+        to_dt = datetime.strptime(date_to, "%Y-%m-%d").date()
+        yesterday = datetime.now(KST).date() - timedelta(days=1)
+        if to_dt > yesterday:
+            to_dt = yesterday
+        if from_dt > to_dt:
+            return [], []
+
+        all_rows: list[dict] = []
+        errors: list[str] = []
+        chunk_start = from_dt
+        while chunk_start <= to_dt:
+            chunk_end = min(chunk_start + timedelta(days=27), to_dt)
+            token = ""
+            for _ in range(50):
+                try:
+                    data = self.list_revenue_history(str(chunk_start), str(chunk_end), token=token)
+                except CoupangClientUnavailable as exc:
+                    errors.append(f"매출인식 조회 실패({chunk_start}~{chunk_end}): {exc}")
+                    break
+                rows = data.get("data") or []
+                all_rows.extend(rows)
+                token = data.get("nextToken") or ""
+                if not rows or not token:
+                    break
+            chunk_start = chunk_end + timedelta(days=1)
+        return all_rows, errors
 
     def list_revenue_history_range(self, days_back: int = 25) -> tuple[list[dict], list[str]]:
         """
