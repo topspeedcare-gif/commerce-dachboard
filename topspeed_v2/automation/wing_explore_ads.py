@@ -87,31 +87,19 @@ def main() -> None:
             page.keyboard.press("Escape")
         page.wait_for_timeout(1000)
 
-        def click_first_visible(text: str) -> bool:
-            candidates = page.get_by_text(text, exact=True).all()
-            for el in candidates:
-                try:
-                    if el.is_visible():
-                        el.click(timeout=5_000)
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        if click_first_visible("광고센터"):
-            print("사이드바에서 '광고센터' 클릭함")
-        else:
-            print("⚠️ 눈에 보이는 '광고센터' 메뉴를 못 찾음 — 스크린샷/page_text로 확인 필요")
-
-        page.wait_for_timeout(2000)
-
-        # 새 탭으로 열릴 수도 있으니 확인한다 (광고센터는 별도 서비스일 가능성 있음).
-        all_pages = context.pages
-        if len(all_pages) > 1:
-            print(f"새 탭이 열림 ({len(all_pages)}개) — 마지막 탭 기준으로 조사")
-            page = all_pages[-1]
+        # '광고센터'는 사이드바 텍스트가 아니라 target="_blank"로 advertising.coupang.com을
+        # 새 탭으로 여는 링크다 (전체 HTML 덤프로 2026-08-06 확인). href로 직접 찾는다.
+        ad_link = page.locator('a[href*="advertising.coupang.com"]').first
+        try:
+            with context.expect_page(timeout=15_000) as new_page_info:
+                ad_link.click(timeout=10_000)
+            page = new_page_info.value
+            page.on("response", on_response)  # 새 탭 페이지에도 응답 캡처를 다시 건다
+            print(f"광고센터 새 탭 열림: {page.url}")
             page.wait_for_load_state("domcontentloaded", timeout=30_000)
             page.wait_for_timeout(3000)
+        except Exception as exc:
+            print(f"⚠️ 광고센터 링크 클릭/새 탭 감지 실패: {exc}")
 
         print(f"현재 URL: {page.url}")
 

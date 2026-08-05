@@ -30,8 +30,8 @@ from shared.db import (
     get_due_experiments,
     get_setting,
     LOW_OFFICE_STOCK_FLOOR_DEFAULT,
-    get_rocket_growth_revenue_estimate,
     get_rocket_growth_low_stock,
+    get_wing_sales_summary,
 )
 
 TOKEN_URL = "https://kauth.kakao.com/oauth/token"
@@ -129,28 +129,26 @@ def build_daily_summary(target_date: str | None = None) -> str:
 
     lines = [f"📊 TOPSPEED 대시보드 요약 ({target_date})"]
 
-    if not rows:
-        lines.append("집계된 데이터가 없습니다.")
+    # 매출은 윙 판매자센터 판매분석 기준(취소·반품 반영, wing_sync.py가 로그인 세션으로
+    # 가져옴)을 우선 쓴다 — 로켓그로스 주문 API 기반 daily_metrics.revenue는 취소·반품이
+    # 안 빠져서 최대 49%까지 부풀려 보이는 걸 확인했다(2026-08-05). 그 세션이 아직 그
+    # 날짜를 못 가져왔으면(만료 등) 그 사실을 그대로 알려준다.
+    wing_rows = get_wing_sales_summary(target_date, target_date)
+    if wing_rows:
+        w = wing_rows[0]
+        lines.append(f"매출: {w['gmv']:,.0f}원 (취소·반품 반영, 정확 — 판매량 {w['units_sold']:,.0f}개)")
     else:
-        revenue = sum(r["revenue"] for r in rows)
+        lines.append("매출: 정확한 수치 없음 (윙 로그인 세션이 만료됐을 수 있어요 — PC에서 wing_login.py 재실행 필요)")
+
+    if not rows:
+        lines.append("(SKU별 광고비·순이익 추정 데이터도 없습니다.)")
+    else:
         ad_spend = sum(r["ad_spend"] for r in rows)
         net_profit = sum(r["net_profit"] for r in rows)
-        roas = round(revenue / ad_spend, 2) if ad_spend else 0.0
         lines += [
-            f"매출: {revenue:,}원 (판매자배송 기준 — 로켓그로스는 아래 별도)",
             f"광고비: {ad_spend:,}원",
-            f"ROAS: {roas}",
-            f"순이익: {net_profit:,}원",
+            f"순이익(추정): {net_profit:,}원 — SKU별 원가·수수료 추정치 기준, 위 정확 매출과 정확히 안 맞물릴 수 있음",
         ]
-
-    rg_estimate = get_rocket_growth_revenue_estimate()
-    if rg_estimate["items"]:
-        lines.append("")
-        lines.append(
-            f"🚀 로켓그로스 추정 일평균 매출: 약 {rg_estimate['total_estimated_daily_revenue']:,}원 "
-            f"(최근 30일 판매속도 x 판매가 기준 추정치, 정확한 당일 매출 아님)"
-        )
-        lines.append(f"  · 추정 일평균 판매량: 약 {rg_estimate['total_estimated_daily_qty']}개")
 
     # 로켓그로스 재고부족은 사무실 재고부족보다 먼저 보여준다 — 주력 판매 채널이라
     # 우선순위가 더 높고, 판매속도 대비 예상 품절일수라 더 실질적인 경고이기도 하다.

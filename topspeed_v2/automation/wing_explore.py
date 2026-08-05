@@ -124,12 +124,35 @@ def main() -> None:
         except Exception as exc:
             print(f"⚠️ 메뉴 클릭 실패: {exc}")
 
-        print("데이터 로딩 대기 중 (최대 20초)...")
+        # 로딩 상태가 불안정해서(같은 클릭도 어떤 때는 되고 어떤 때는 "Loading items..."에서
+        # 영영 멈춤, 2026-08-06 확인 — 윙 자체 프론트엔드 이슈로 보임) 알고 있는 실제 API
+        # 응답을 기다리다 안 오면 새로고침해서 몇 번 재시도한다.
+        got_response = False
+        for attempt in range(3):
+            print(f"sale-statistics 응답 대기 중 (시도 {attempt + 1}/3, 최대 15초)...")
+            try:
+                page.wait_for_response(
+                    lambda r: "sale-statistics/data" in r.url and r.status == 200, timeout=15_000
+                )
+                print("응답 도착함")
+                got_response = True
+                break
+            except Exception:
+                print("⚠️ 15초 안에 응답을 못 받음 — 새로고침 후 재시도")
+                page.reload(wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(2000)
+        if not got_response:
+            print("⚠️ 3번 재시도해도 응답을 못 받았습니다 — 그래도 계속 진행합니다.")
+        page.wait_for_timeout(2000)
+
+        # 하단 옵션목록 표가 스크롤해야 로드되는 지연 로딩일 수 있어 끝까지 내려본다.
         try:
-            page.wait_for_selector("text=Loading items", state="detached", timeout=20_000)
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(1500)
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
         except Exception:
-            print("⚠️ 'Loading items...' 상태가 20초 안에 안 사라졌습니다 — 그래도 계속 진행합니다.")
-        page.wait_for_timeout(3000)
+            pass
 
         (OUT_DIR / "page_text.txt").write_text(page.inner_text("body"), encoding="utf-8")
         (OUT_DIR / "network_log.txt").write_text("\n".join(network_log), encoding="utf-8")
