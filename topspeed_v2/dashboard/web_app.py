@@ -13,6 +13,7 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -39,10 +40,12 @@ from shared.db import (
     get_channel_inventory,
 )
 from dashboard.seed_demo import seed_demo_data
-from dashboard.sync_job import run_sync
+from dashboard.sync_job import run_sync, sync_date_range
 from dashboard.settlement_sync import run_settlement_sync
 from dashboard.channel_inventory_sync import run_channel_inventory_sync
 from dashboard.coupang_client import CoupangClient, CoupangClientUnavailable
+from dashboard.ad_report_importer import import_ad_report
+from dashboard.sync_health import check_and_alert, read_last_sync_status
 
 st.set_page_config(page_title="TOPSPEED 대시보드", layout="wide")
 init_db()
@@ -69,6 +72,14 @@ def check_password() -> bool:
 
 if not check_password():
     st.stop()
+
+
+# ── 동기화 안전장치: 열 때마다 어제 데이터가 들어왔는지 조용히 확인 ──
+# 문제가 없으면 아무것도 안 하고 넘어간다. 문제가 있으면 카톡으로도 알리고
+# (하루 한 번만, 중복 발송 방지) 화면에도 배너로 보여준다.
+_health = check_and_alert()
+if not _health["ok"]:
+    st.warning(f"🩺 {_health['message'] or '동기화 상태를 확인해주세요.'}")
 
 
 # ── 데이터 조회 헬퍼 ───────────────────────────────────────
@@ -145,28 +156,54 @@ with tab_dash:
             st.rerun()
 
     col1, col2 = st.columns(2)
-    start = col1.date_input("시작일", value=date.today())
+    start = col1.date_input("시작일", value=date.today() - timedelta(days=6))
     end = col2.date_input("종료일", value=date.today())
 
     rows = fetch_metrics(str(start), str(end))
 
     if not rows:
-        st.info("해당 기간에 집계된 데이터가 없습니다. sync_job.py를 먼저 실행하세요.")
+        st.info("해당 기간에 집계된 데이터가 없습니다. 설정 탭에서 먼저 동기화하세요.")
     else:
         total_revenue = sum(r["revenue"] for r in rows)
         total_profit = sum(r["net_profit"] for r in rows)
         total_ad = sum(r["ad_spend"] for r in rows)
+        wing_revenue = sum(r["revenue"] for r in rows if r["channel"] == "wing")
+        rocket_revenue = sum(r["revenue"] for r in rows if r["channel"] == "rocket")
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("매출 (판매자배송)", f"{total_revenue:,}원")
+        m1.metric("매출 (윙 + 로켓그로스)", f"{total_revenue:,}원")
         m2.metric("실손익", f"{total_profit:,}원")
         m3.metric("광고비", f"{total_ad:,}원")
+
+        c1, c2 = st.columns(2)
+        c1.metric("· 윙(판매자배송) 매출", f"{wing_revenue:,}원")
+        c2.metric("· 로켓그로스 매출", f"{rocket_revenue:,}원")
+        st.caption(
+            "윙은 쿠팡 주문서(ordersheets) API, 로켓그로스는 로켓그로스 주문 API(paidAt "
+            "기준) — 둘 다 실시간이며 지연이 없습니다. 실제 윙 판매자센터 대조 검증 "
+            "결과 약 7% 오차 범위(2026-07-29 확인, 취소·반품 건이 섞였을 가능성)."
+        )
 
         st.subheader("SKU별 상세")
         st.dataframe(rows, use_container_width=True)
 
+        # SKU별로 저장된 daily_metrics를 날짜 단위로 합산 — 하루에 SKU가 여러 개면
+        # 날짜별 차트에서는 그날 전체 합계가 필요하다.
+        by_date: dict[str, dict] = {}
+        for r in rows:
+            d = by_date.setdefault(r["date"], {"revenue": 0, "ad_spend": 0, "net_profit": 0})
+            d["revenue"] += r["revenue"]
+            d["ad_spend"] += r["ad_spend"]
+            d["net_profit"] += r["net_profit"]
+
         st.subheader("일별 매출 추이")
-        st.bar_chart({r["date"]: r["revenue"] for r in rows})
+        st.bar_chart({d: v["revenue"] for d, v in by_date.items()})
+
+        st.subheader("일별 광고비 추이")
+        st.bar_chart({d: v["ad_spend"] for d, v in by_date.items()})
+
+        st.subheader("일별 순이익 추이")
+        st.bar_chart({d: v["net_profit"] for d, v in by_date.items()})
 
     st.subheader("🚀 로켓그로스 추정 매출")
     st.caption(
@@ -337,7 +374,9 @@ with tab_inv:
     else:
         st.dataframe(
             [
-                {**p, "stock_days": p["stock_days"] if p["stock_days"] is not None else "예측 불가"}
+                # stock_days를 숫자/문자 섞어서 넣으면 Arrow 직렬화가 깨진다 —
+                # 컬럼 하나는 타입을 통일해야 해서, None만 있던 곳도 전부 문자열로 맞춘다.
+                {**p, "stock_days": f"{p['stock_days']}일" if p["stock_days"] is not None else "예측 불가"}
                 for p in predictions
             ],
             use_container_width=True,
@@ -413,9 +452,29 @@ with tab_exp:
 
 # 5) 설정 — 원가·알람 임계치
 with tab_settings:
+    st.subheader("🩺 자동 동기화 상태")
+    _last_status = read_last_sync_status()
+    if not _last_status:
+        st.caption("automation/Daily_sync.py가 아직 한 번도 실행되지 않았거나, 상태 파일이 이 배포본엔 없습니다 (로컬 PC에만 남는 파일이라 Streamlit Cloud에는 안 보일 수 있어요).")
+    else:
+        _stage_icon = lambda ok: "✅" if ok else "❌"
+        st.caption(
+            f"마지막 자동 동기화 대상일: {_last_status.get('target_date', '?')} "
+            f"(기록 시각: {_last_status.get('finished_at', '?')})\n\n"
+            f"동기화 {_stage_icon(_last_status.get('sync_ok'))} · "
+            f"git commit {_stage_icon(_last_status.get('git_committed'))} · "
+            f"git push {_stage_icon(_last_status.get('git_pushed'))} · "
+            f"카톡 발송 {_stage_icon(_last_status.get('kakao_sent'))}"
+        )
+    if not _health["ok"]:
+        st.caption(f"⚠️ 방금 확인: {_health['message']}")
+
     st.subheader("🔗 쿠팡 실시간 연동")
     st.caption(
-        "API 키를 입력하고 동기화하면 오늘 날짜 기준으로 매출·재고를 바로 가져옵니다. "
+        "쿠팡 주문서(ordersheets) API 기준이라 실시간입니다 — 오늘 날짜도 바로 동기화됩니다. "
+        "판매자배송(윙) 매출만 잡히고, 로켓그로스는 별도 추정치로 아래에 표시됩니다. "
+        "과거 날짜도 자유롭게 선택할 수 있어요 (최대 6개월 전까지). 하루하루 순서대로 "
+        "조회하는 방식이라 기간이 길수록 오래 걸립니다(실측 약 9초/일). "
         "키는 저장되지 않고 이번 세션에서만 사용됩니다."
     )
     with st.form("live_sync_form"):
@@ -424,13 +483,15 @@ with tab_settings:
         secret_key = c2.text_input("COUPANG_SECRET_KEY", type="password")
         vendor_id = c3.text_input("COUPANG_VENDOR_ID")
 
-        with st.expander("광고 API 키 (선택 — 발급받으셨다면)"):
-            ac1, ac2, ac3 = st.columns(3)
-            ads_access = ac1.text_input("ADS_ACCESS_KEY", type="password")
-            ads_secret = ac2.text_input("ADS_SECRET_KEY", type="password")
-            ads_account = ac3.text_input("ADS_ACCOUNT_ID")
+        d1, d2 = st.columns(2)
+        sync_start = d1.date_input(
+            "동기화 시작일", value=date.today() - timedelta(days=6),
+            min_value=date.today() - timedelta(days=183),
+            help="최대 6개월 전까지 선택할 수 있습니다.",
+        )
+        sync_end = d2.date_input("동기화 종료일", value=date.today())
 
-        sync_submitted = st.form_submit_button("지금 동기화 실행")
+        sync_submitted = st.form_submit_button("동기화 실행")
 
     diag_col, _ = st.columns([1, 3])
     if diag_col.button("🔍 연결만 먼저 진단하기"):
@@ -462,21 +523,38 @@ with tab_settings:
         if not (access_key and secret_key and vendor_id):
             st.error("쿠팡 오픈API 키 3개(ACCESS/SECRET/VENDOR)는 필수입니다.")
         else:
-            with st.spinner("쿠팡 데이터 가져오는 중..."):
-                today_str = str(date.today())
-                result = run_sync(
-                    target_date=today_str,
+            days = (sync_end - sync_start).days + 1
+            est_minutes = max(1, round(days * 9 / 60))  # 실측 약 9초/일 기준
+            with st.spinner(f"쿠팡 데이터 가져오는 중... ({days}일치, 대략 {est_minutes}분 예상)"):
+                result = sync_date_range(
+                    start_date=str(sync_start),
+                    end_date=str(sync_end),
                     unit_costs={},
                     access_key=access_key,
                     secret_key=secret_key,
                     vendor_id=vendor_id,
-                    ads_access=ads_access or None,
-                    ads_secret=ads_secret or None,
-                    ads_account=ads_account or None,
                 )
             st.code(result)
-            if result.startswith("✅") or "완료" in result:
+            if "✅" in result:
                 st.success("동기화 완료! 📊 대시보드 탭에서 확인하세요.")
+
+    st.divider()
+    st.subheader("📢 광고 리포트 등록")
+    st.caption(
+        "쿠팡은 셀러용 광고 성과 공개 API를 제공하지 않습니다 (확인 완료). "
+        "쿠팡 윙 광고관리센터 > '기간별 키워드' 리포트를 엑셀로 받아 여기에 올리면, "
+        "이미 동기화된 매출·판매량 위에 광고비만 반영해서 순이익·ROAS를 다시 계산합니다."
+    )
+    ad_file = st.file_uploader("광고 리포트 엑셀 (.xlsx)", type=["xlsx"], key="ad_report_upload")
+    if ad_file is not None and st.button("이 파일 등록하기"):
+        temp_path = Path("runtime_workspace") / "_uploads" / ad_file.name
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_bytes(ad_file.getvalue())
+        with st.spinner("광고 리포트 반영 중..."):
+            result = import_ad_report(temp_path)
+        st.code(result)
+        if result.startswith("✅"):
+            st.success("등록 완료! 📊 대시보드 탭에서 순이익/ROAS 확인하세요.")
 
     st.divider()
     st.subheader("SKU별 원가 설정")

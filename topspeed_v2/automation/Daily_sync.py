@@ -15,6 +15,7 @@ Windows 작업 스케줄러가 매일 이 파일을 실행하면:
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 
 KST = ZoneInfo("Asia/Seoul")
 LOG_PATH = ROOT / "automation" / "sync_log.txt"
+STATUS_PATH = ROOT / "automation" / "last_sync_status.json"
 
 
 def find_git() -> str:
@@ -63,8 +65,16 @@ GIT_EXE = None  # main()에서 채워짐
 def log(msg: str) -> None:
     line = f"[{datetime.now(KST).isoformat(timespec='seconds')}] {msg}"
     print(line)
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as exc:
+        # 로그 파일 기록 실패가 동기화 자체를 막아선 안 된다 — 2026-07-26~08-05(10일간)
+        # daily_sync.bat의 stdout 리다이렉트(>> sync_log.txt)와 이 open()이 같은 파일을
+        # 동시에 붙잡으면서 매번 여기서 PermissionError로 죽어 동기화가 통째로 실패했다.
+        # bat의 리다이렉트는 제거했지만, 다른 이유(OneDrive 동기화 등)로 파일이 잠겨도
+        # 최소한 콘솔 출력은 남도록 방어한다.
+        print(f"⚠️ 로그 파일 기록 실패 (동기화는 계속 진행): {exc}")
 
 
 def run_git(*args: str) -> tuple[int, str]:
@@ -72,6 +82,20 @@ def run_git(*args: str) -> tuple[int, str]:
         [GIT_EXE, *args], cwd=ROOT, capture_output=True, text=True
     )
     return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def _write_status(status: dict) -> None:
+    """
+    이번 실행이 어디까지 갔는지 JSON으로 남긴다 — dashboard/sync_health.py가
+    이 파일을 읽어서 "동기화는 됐는데 git push만 실패해서 배포된 대시보드엔
+    안 보이는" 것 같은, sync_log.txt를 일일이 파싱하지 않고는 알기 어려운
+    상황을 구분해낸다. 실행이 어느 단계에서 끝나든(성공/실패 무관) 항상 남긴다.
+    """
+    status["finished_at"] = datetime.now(KST).isoformat(timespec="seconds")
+    try:
+        STATUS_PATH.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log(f"⚠️ 상태 파일 기록 실패 (본 동기화 결과엔 영향 없음): {exc}")
 
 
 def main() -> None:
@@ -100,40 +124,65 @@ def main() -> None:
     from dashboard.sync_job import run_sync
 
     target_date = str(datetime.now(KST).date() - timedelta(days=1))
-    log(f"동기화 시작: {target_date}")
+    status = {
+        "target_date": target_date,
+        "sync_ok": False,
+        "git_committed": False,
+        "git_pushed": False,
+        "kakao_sent": False,
+    }
 
-    result = run_sync(target_date, unit_costs={})
-    log("동기화 결과:\n" + result)
+    try:
+        log(f"동기화 시작: {target_date}")
 
-    # DB 변경사항을 GitHub에 반영
-    code, out = run_git("add", "shared/topspeed.db")
-    log(f"git add: {out or 'OK'}")
+        result = run_sync(target_date, unit_costs={})
+        log("동기화 결과:\n" + result)
+        status["sync_ok"] = "❌" not in result
 
-    code, out = run_git("status", "--porcelain")
-    if not out.strip():
-        log("변경사항 없음 (동기화 결과가 이전과 동일) — commit 생략")
-        return
+        # DB 변경사항을 GitHub에 반영
+        code, out = run_git("add", "shared/topspeed.db")
+        log(f"git add: {out or 'OK'}")
 
-    code, out = run_git("commit", "-m", f"auto sync {target_date}")
-    log(f"git commit: {out}")
-    if code != 0:
-        log("❌ commit 실패 — 아래 push는 건너뜁니다")
-        return
+        code, out = run_git("status", "--porcelain")
+        if not out.strip():
+            log("변경사항 없음 (동기화 결과가 이전과 동일) — commit 생략")
+            # 변경사항이 없다는 건 이미 최신 상태로 커밋·푸시돼 있다는 뜻이라 실패가 아니다.
+            status["git_committed"] = True
+            status["git_pushed"] = True
+            return
 
-    code, out = run_git("push")
-    log(f"git push: {out}")
-    if code == 0:
-        log("✅ GitHub 반영 완료 — Streamlit Cloud가 곧 자동 재배포됩니다")
+        code, out = run_git("commit", "-m", f"auto sync {target_date}")
+        log(f"git commit: {out}")
+        if code != 0:
+            log("❌ commit 실패 — 아래 push는 건너뜁니다")
+            return
+        status["git_committed"] = True
 
-        try:
-            from automation.kakao_notify import send_daily_summary
-            kakao_result = send_daily_summary(target_date)
-            log(f"카카오톡 알림 발송: {kakao_result}")
-        except Exception as exc:
-            log(f"⚠️ 카카오톡 알림 발송 실패 (동기화 자체는 정상 완료됨): {exc}")
-    else:
-        log("❌ push 실패 — 수동으로 'git push' 한번 실행해서 인증을 확인해보세요")
+        code, out = run_git("push")
+        log(f"git push: {out}")
+        if code == 0:
+            status["git_pushed"] = True
+            log("✅ GitHub 반영 완료 — Streamlit Cloud가 곧 자동 재배포됩니다")
+
+            try:
+                from automation.kakao_notify import send_daily_summary
+                kakao_result = send_daily_summary(target_date)
+                log(f"카카오톡 알림 발송: {kakao_result}")
+                status["kakao_sent"] = True
+            except Exception as exc:
+                log(f"⚠️ 카카오톡 알림 발송 실패 (동기화 자체는 정상 완료됨): {exc}")
+        else:
+            log("❌ push 실패 — 수동으로 'git push' 한번 실행해서 인증을 확인해보세요")
+    finally:
+        _write_status(status)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # bat의 stdout 리다이렉트를 없앴으니, 여기서 처리 안 된 예외가 나면
+        # 콘솔에만 찍히고 아무 데도 안 남을 수 있다 — log()로 한 번 더 남긴다.
+        import traceback
+        log("❌ 처리되지 않은 예외로 중단됨:\n" + traceback.format_exc())
+        raise
