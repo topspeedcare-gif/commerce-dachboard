@@ -470,18 +470,32 @@ with tab_settings:
         st.caption(f"⚠️ 방금 확인: {_health['message']}")
 
     st.subheader("🔗 쿠팡 실시간 연동")
+    _secret_access_key = st.secrets.get("COUPANG_ACCESS_KEY", "")
+    _secret_secret_key = st.secrets.get("COUPANG_SECRET_KEY", "")
+    _secret_vendor_id = st.secrets.get("COUPANG_VENDOR_ID", "")
+    _keys_from_secrets = bool(_secret_access_key and _secret_secret_key and _secret_vendor_id)
+    if _keys_from_secrets:
+        st.caption(
+            "✅ 쿠팡 API 키가 Streamlit Secrets에 등록되어 있어 자동으로 채워집니다 — 매번 입력하지 않아도 됩니다. "
+            "다른 계정으로 임시로 조회하고 싶을 때만 아래 값을 직접 바꾸세요."
+        )
+    else:
+        st.caption(
+            "매번 키를 입력하지 않으려면: 이 앱의 우측 하단 'Manage app' → Settings → Secrets에 "
+            "COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY, COUPANG_VENDOR_ID를 등록해두세요 "
+            "(APP_PASSWORD 등록했던 곳과 같은 화면입니다). 등록해두면 이 페이지가 자동으로 채워줍니다."
+        )
     st.caption(
         "쿠팡 주문서(ordersheets) API 기준이라 실시간입니다 — 오늘 날짜도 바로 동기화됩니다. "
         "판매자배송(윙) 매출만 잡히고, 로켓그로스는 별도 추정치로 아래에 표시됩니다. "
         "과거 날짜도 자유롭게 선택할 수 있어요 (최대 6개월 전까지). 하루하루 순서대로 "
-        "조회하는 방식이라 기간이 길수록 오래 걸립니다(실측 약 9초/일). "
-        "키는 저장되지 않고 이번 세션에서만 사용됩니다."
+        "조회하는 방식이라 기간이 길수록 오래 걸립니다(실측 약 9초/일)."
     )
     with st.form("live_sync_form"):
         c1, c2, c3 = st.columns(3)
-        access_key = c1.text_input("COUPANG_ACCESS_KEY", type="password")
-        secret_key = c2.text_input("COUPANG_SECRET_KEY", type="password")
-        vendor_id = c3.text_input("COUPANG_VENDOR_ID")
+        access_key = c1.text_input("COUPANG_ACCESS_KEY", type="password", value=_secret_access_key)
+        secret_key = c2.text_input("COUPANG_SECRET_KEY", type="password", value=_secret_secret_key)
+        vendor_id = c3.text_input("COUPANG_VENDOR_ID", value=_secret_vendor_id)
 
         d1, d2 = st.columns(2)
         sync_start = d1.date_input(
