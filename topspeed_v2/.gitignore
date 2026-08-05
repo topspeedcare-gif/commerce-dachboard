@@ -5,3 +5,6 @@
 __pycache__/
 *.pyc
 automation/sync_log.txt
+runtime_workspace/
+automation/.wing_session.json
+automation/_wing_explore_output/

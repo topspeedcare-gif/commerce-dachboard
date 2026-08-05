@@ -38,6 +38,7 @@ from shared.db import (
     ROCKET_STOCK_ALERT_DAYS_DEFAULT,
     get_settlement_vs_expected,
     get_channel_inventory,
+    get_wing_sales_summary,
 )
 from dashboard.seed_demo import seed_demo_data
 from dashboard.sync_job import run_sync, sync_date_range
@@ -160,50 +161,60 @@ with tab_dash:
     end = col2.date_input("종료일", value=date.today())
 
     rows = fetch_metrics(str(start), str(end))
+    wing_summary_rows = get_wing_sales_summary(str(start), str(end))
+    wing_summary_by_date = {r["date"]: r for r in wing_summary_rows}
 
-    if not rows:
+    if not rows and not wing_summary_rows:
         st.info("해당 기간에 집계된 데이터가 없습니다. 설정 탭에서 먼저 동기화하세요.")
     else:
-        total_revenue = sum(r["revenue"] for r in rows)
+        total_revenue = sum(r["gmv"] for r in wing_summary_rows)
+        total_qty = sum(r["units_sold"] for r in wing_summary_rows)
         total_profit = sum(r["net_profit"] for r in rows)
         total_ad = sum(r["ad_spend"] for r in rows)
-        wing_revenue = sum(r["revenue"] for r in rows if r["channel"] == "wing")
-        rocket_revenue = sum(r["revenue"] for r in rows if r["channel"] == "rocket")
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("매출 (윙 + 로켓그로스)", f"{total_revenue:,}원")
-        m2.metric("실손익", f"{total_profit:,}원")
+        m1.metric("매출 (취소·반품 반영, 정확)", f"{total_revenue:,.0f}원")
+        m2.metric("판매량", f"{total_qty:,.0f}개")
         m3.metric("광고비", f"{total_ad:,}원")
-
-        c1, c2 = st.columns(2)
-        c1.metric("· 윙(판매자배송) 매출", f"{wing_revenue:,}원")
-        c2.metric("· 로켓그로스 매출", f"{rocket_revenue:,}원")
         st.caption(
-            "윙은 쿠팡 주문서(ordersheets) API, 로켓그로스는 로켓그로스 주문 API(paidAt "
-            "기준) — 둘 다 실시간이며 지연이 없습니다. 실제 윙 판매자센터 대조 검증 "
-            "결과 약 7% 오차 범위(2026-07-29 확인, 취소·반품 건이 섞였을 가능성)."
+            "윙 판매자센터의 '비즈니스 인사이트 > 판매분석'에서 가져온 확정 수치입니다 "
+            "(취소·반품이 이미 반영되어 있음) — automation/wing_sync.py가 로그인 세션으로 "
+            "가져옵니다. 세션이 오래돼 만료되면 여기 숫자가 갱신을 멈추니, 그럴 땐 PC에서 "
+            "'python automation\\wing_login.py'로 다시 로그인해주세요."
         )
 
-        st.subheader("SKU별 상세")
-        st.dataframe(rows, use_container_width=True)
+        missing_dates = [
+            str(start + timedelta(days=i))
+            for i in range((end - start).days + 1)
+            if str(start + timedelta(days=i)) not in wing_summary_by_date
+        ]
+        if missing_dates:
+            st.warning(f"⚠️ 아래 날짜는 정확한 매출 데이터가 아직 없습니다: {', '.join(missing_dates)}")
 
-        # SKU별로 저장된 daily_metrics를 날짜 단위로 합산 — 하루에 SKU가 여러 개면
-        # 날짜별 차트에서는 그날 전체 합계가 필요하다.
-        by_date: dict[str, dict] = {}
-        for r in rows:
-            d = by_date.setdefault(r["date"], {"revenue": 0, "ad_spend": 0, "net_profit": 0})
-            d["revenue"] += r["revenue"]
-            d["ad_spend"] += r["ad_spend"]
-            d["net_profit"] += r["net_profit"]
+        st.caption(
+            f"참고: 실손익(약 {total_profit:,.0f}원)은 아직 SKU별 원가·수수료 추정치(로켓그로스 "
+            "주문 API 기준, 취소·반품 미반영)로 계산됩니다 — 위 매출과 정확히 맞물리진 않습니다."
+        )
 
-        st.subheader("일별 매출 추이")
-        st.bar_chart({d: v["revenue"] for d, v in by_date.items()})
+        if rows:
+            st.subheader("SKU별 상세 (참고용 — 취소·반품 미반영 추정치)")
+            st.dataframe(rows, use_container_width=True)
 
-        st.subheader("일별 광고비 추이")
-        st.bar_chart({d: v["ad_spend"] for d, v in by_date.items()})
+        st.subheader("일별 매출 추이 (정확)")
+        st.bar_chart({r["date"]: r["gmv"] for r in wing_summary_rows})
 
-        st.subheader("일별 순이익 추이")
-        st.bar_chart({d: v["net_profit"] for d, v in by_date.items()})
+        if rows:
+            by_date: dict[str, dict] = {}
+            for r in rows:
+                d = by_date.setdefault(r["date"], {"ad_spend": 0, "net_profit": 0})
+                d["ad_spend"] += r["ad_spend"]
+                d["net_profit"] += r["net_profit"]
+
+            st.subheader("일별 광고비 추이")
+            st.bar_chart({d: v["ad_spend"] for d, v in by_date.items()})
+
+            st.subheader("일별 순이익 추이 (추정)")
+            st.bar_chart({d: v["net_profit"] for d, v in by_date.items()})
 
     st.subheader("🚀 로켓그로스 추정 매출")
     st.caption(

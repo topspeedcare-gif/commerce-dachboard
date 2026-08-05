@@ -101,6 +101,17 @@ CREATE TABLE IF NOT EXISTS channel_inventory (
     rocket_sales_last_30d   INTEGER,
     synced_at               TEXT NOT NULL
 );
+
+-- 윙 판매자센터(비즈니스 인사이트 > 판매분석)에서 가져온, 취소·반품까지 반영된
+-- 확정 매출/판매량. 공식 오픈API에는 없는 값이라 automation/wing_sync.py가
+-- 로그인 세션 쿠키로 긁어온다 (automation/wing_login.py, wing_sync.py 참고).
+-- 로켓그로스 주문 API(paidAt 기준, 취소/반품 미반영) 추정치보다 이게 진짜 매출이다.
+CREATE TABLE IF NOT EXISTS wing_sales_summary (
+    date            TEXT PRIMARY KEY,
+    gmv             REAL NOT NULL,
+    units_sold      REAL NOT NULL,
+    synced_at       TEXT NOT NULL
+);
 """
 
 
@@ -711,6 +722,44 @@ def get_channel_inventory() -> list[dict]:
         rows = conn.execute(
             "SELECT product_name, wing_qty, rocket_qty, rocket_sales_last_30d, synced_at "
             "FROM channel_inventory ORDER BY product_name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_wing_sales_summary(rows: list[dict], synced_at: str) -> int:
+    """automation/wing_sync.py가 긁어온 (date, gmv, unitsSold)를 저장한다.
+    같은 날짜가 다시 들어오면(재실행·값 갱신) 덮어쓴다."""
+    count = 0
+    with get_conn() as conn:
+        for r in rows:
+            date = r.get("date")
+            if not date:
+                continue
+            conn.execute(
+                """
+                INSERT INTO wing_sales_summary (date, gmv, units_sold, synced_at)
+                VALUES (:date, :gmv, :units_sold, :synced_at)
+                ON CONFLICT(date) DO UPDATE SET
+                    gmv=excluded.gmv, units_sold=excluded.units_sold, synced_at=excluded.synced_at
+                """,
+                {
+                    "date": date,
+                    "gmv": r.get("gmv", 0) or 0,
+                    "units_sold": r.get("unitsSold", 0) or 0,
+                    "synced_at": synced_at,
+                },
+            )
+            count += 1
+    return count
+
+
+def get_wing_sales_summary(date_from: str, date_to: str) -> list[dict]:
+    """date_from~date_to(포함) 구간의 정확한(취소/반품 반영된) 윙 매출을 날짜순으로 반환."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, gmv, units_sold, synced_at FROM wing_sales_summary "
+            "WHERE date BETWEEN ? AND ? ORDER BY date",
+            (date_from, date_to),
         ).fetchall()
     return [dict(r) for r in rows]
 

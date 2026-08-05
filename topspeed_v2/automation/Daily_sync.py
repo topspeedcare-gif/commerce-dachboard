@@ -139,6 +139,17 @@ def main() -> None:
         log("동기화 결과:\n" + result)
         status["sync_ok"] = "❌" not in result
 
+        # 취소·반품까지 반영된 정확한 매출(wing_sync.py, 윙 로그인 세션 재사용) —
+        # 세션이 만료돼 실패해도 로켓그로스 주문 API 기반 동기화 자체는 이미 끝났으니
+        # 여기서 막지 않는다. 세션 재로그인은 사람이 python automation\wing_login.py로
+        # 직접 해야 한다(비밀번호를 쓰는 부분이라 자동화하지 않음).
+        try:
+            from automation.wing_sync import run_wing_sync
+            wing_result = run_wing_sync()
+            log(f"윙 판매통계 동기화: {wing_result}")
+        except Exception as exc:
+            log(f"⚠️ 윙 판매통계 동기화 실패 (동기화 자체는 정상 진행): {exc}")
+
         # DB 변경사항을 GitHub에 반영
         code, out = run_git("add", "shared/topspeed.db")
         log(f"git add: {out or 'OK'}")
