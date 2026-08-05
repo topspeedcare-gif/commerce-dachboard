@@ -9,6 +9,7 @@ dashboard/web_app.py — TOPSPEED 웹 대시보드 (4단계: 배포 가능한 �
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -190,6 +191,17 @@ with tab_dash:
         ]
         if missing_dates:
             st.warning(f"⚠️ 아래 날짜는 정확한 매출 데이터가 아직 없습니다: {', '.join(missing_dates)}")
+
+        _ad_summary_raw = get_setting("wing_ad_summary_7d", "")
+        if _ad_summary_raw:
+            _ad_summary = json.loads(_ad_summary_raw)
+            _ad_synced_at = get_setting("wing_ad_summary_7d_synced_at", "")
+            st.subheader("📢 광고 성과 (최근 7일, 오늘 제외 · 자동)")
+            a1, a2, a3 = st.columns(3)
+            a1.metric("집행 광고비", f"{_ad_summary.get('DELIVERED_AD_COST', 0):,.0f}원")
+            a2.metric("상품 광고 전환 매출", f"{_ad_summary.get('AD_ATTRIBUTED_SALES', 0):,.0f}원")
+            a3.metric("광고 수익률(ROAS)", f"{_ad_summary.get('ROAS', 0)}%")
+            st.caption(f"윙 홈 대시보드 카드 기준, 날짜별이 아닌 최근 7일 누적값입니다. (동기화: {_ad_synced_at[:16] or '?'})")
 
         st.caption(
             f"참고: 실손익(약 {total_profit:,.0f}원)은 아직 SKU별 원가·수수료 추정치(로켓그로스 "

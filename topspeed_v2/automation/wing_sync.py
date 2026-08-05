@@ -38,6 +38,10 @@ sys.path.insert(0, str(ROOT))
 
 SESSION_PATH = ROOT / "automation" / ".wing_session.json"
 DATA_URL = "https://wing.coupang.com/tenants/rfm-ss/api/nudging-card/sale-statistics/data"
+# 윙 홈 대시보드의 "매출 성장 캠페인 성과" 카드가 쓰는 API. 날짜별이 아니라 "최근 7일
+# 누적(오늘 제외)" 하나로 뭉쳐진 스냅샷이다 — 그래서 날짜별 테이블이 아니라
+# settings에 통짜로 저장한다(wing_ad_summary_7d 키, 값은 JSON 문자열).
+AD_SUMMARY_URL = "https://wing.coupang.com/tenants/cmg-wing-card/wing/widget/data/Metric"
 KST = ZoneInfo("Asia/Seoul")
 
 
@@ -86,23 +90,75 @@ def fetch_sale_statistics() -> list[dict]:
     return data.get("cardData") or []
 
 
+def _fetch_json(url: str) -> dict:
+    cookie_header = _load_cookie_header()
+    req = urllib.request.Request(url, headers={"Cookie": cookie_header, "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise WingSessionExpired(
+                f"윙 세션이 만료된 것 같습니다(HTTP {exc.code}). "
+                "'python automation\\wing_login.py'로 다시 로그인해주세요."
+            ) from exc
+        raise RuntimeError(f"조회 실패: HTTP {exc.code} {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"조회 실패(연결 오류): {exc}") from exc
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        raise WingSessionExpired(
+            "응답이 JSON이 아닙니다 — 세션 만료로 로그인 페이지가 내려온 것으로 보입니다. "
+            "'python automation\\wing_login.py'로 다시 로그인해주세요."
+        )
+
+
+def fetch_ad_summary_7d() -> dict | None:
+    """최근 7일(오늘 제외) 누적 광고비/전환매출/ROAS. 위젯이 없으면(광고 미집행 등) None."""
+    data = _fetch_json(AD_SUMMARY_URL)
+    for metric in data.get("Metric") or []:
+        if metric.get("type") == "CAMPAIGN_PERFORMANCE_SUMMARY":
+            return metric.get("data")
+    return None
+
+
 def run_wing_sync() -> str:
     """반환값: 사람이 읽는 결과 요약 문자열 (예외를 던지지 않음)."""
-    from shared.db import init_db, upsert_wing_sales_summary
+    from shared.db import init_db, upsert_wing_sales_summary, set_setting
 
     init_db()
+    lines = []
+
     try:
         rows = fetch_sale_statistics()
     except (WingSessionExpired, RuntimeError) as exc:
         return f"❌ {exc}"
 
     if not rows:
-        return "⚠️ 윙 판매통계 응답이 비어있습니다."
+        lines.append("⚠️ 윙 판매통계 응답이 비어있습니다.")
+    else:
+        count = upsert_wing_sales_summary(rows, datetime.now(KST).isoformat())
+        dates = sorted(r["date"] for r in rows if r.get("date"))
+        date_range = f"{dates[0]} ~ {dates[-1]}" if dates else "?"
+        lines.append(f"✅ 윙 판매통계 동기화 완료 — {count}일치 저장 ({date_range})")
 
-    count = upsert_wing_sales_summary(rows, datetime.now(KST).isoformat())
-    dates = sorted(r["date"] for r in rows if r.get("date"))
-    date_range = f"{dates[0]} ~ {dates[-1]}" if dates else "?"
-    return f"✅ 윙 판매통계 동기화 완료 — {count}일치 저장 ({date_range})"
+    try:
+        ad_summary = fetch_ad_summary_7d()
+        if ad_summary:
+            set_setting("wing_ad_summary_7d", json.dumps(ad_summary, ensure_ascii=False))
+            set_setting("wing_ad_summary_7d_synced_at", datetime.now(KST).isoformat())
+            lines.append(
+                f"✅ 광고 성과(최근 7일) 동기화 완료 — 광고비 {ad_summary.get('DELIVERED_AD_COST'):,.0f}원 "
+                f"/ 전환매출 {ad_summary.get('AD_ATTRIBUTED_SALES'):,.0f}원 / ROAS {ad_summary.get('ROAS')}%"
+            )
+        else:
+            lines.append("ℹ️ 광고 성과 데이터 없음 (집행 중인 캠페인이 없을 수 있음)")
+    except (WingSessionExpired, RuntimeError) as exc:
+        lines.append(f"⚠️ 광고 성과 동기화 실패: {exc}")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
