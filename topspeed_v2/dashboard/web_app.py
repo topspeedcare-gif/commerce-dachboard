@@ -470,6 +470,15 @@ with tab_settings:
         st.caption(f"⚠️ 방금 확인: {_health['message']}")
 
     st.subheader("🔗 쿠팡 실시간 연동")
+    st.warning(
+        "⚠️ **이 아래 동기화 버튼은 지금 보고 계신 배포된(Streamlit Cloud) 화면에서는 항상 실패합니다.** "
+        "쿠팡 오픈API는 미리 등록해둔 IP에서 온 요청만 받는데, 이 버튼을 누르면 브라우저가 아니라 "
+        "Streamlit 서버 컴퓨터가 쿠팡에 요청을 보내고, 그 서버의 IP는 등록되어 있지 않아서 "
+        "'HTTP 403 Forbidden'으로 막힙니다. 실제 데이터는 PC의 자동 동기화(매일 자동 실행)로만 들어오고, "
+        "지금 당장 최신 데이터를 넣고 싶으면 대시보드가 아니라 **PC에서 직접** "
+        "`python automation\\Daily_sync.py`를 실행해주세요. (PC에서 직접 `streamlit run`으로 이 화면을 켰을 때는 "
+        "PC의 등록된 IP로 나가므로 이 버튼이 정상 작동합니다.)"
+    )
     _secret_access_key = st.secrets.get("COUPANG_ACCESS_KEY", "")
     _secret_secret_key = st.secrets.get("COUPANG_SECRET_KEY", "")
     _secret_vendor_id = st.secrets.get("COUPANG_VENDOR_ID", "")
